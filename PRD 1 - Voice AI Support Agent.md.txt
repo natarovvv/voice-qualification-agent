@@ -1,0 +1,31 @@
+﻿PRD: Voice AI Support & Qualification Agent
+1. Overview, Target Client & Value Proposition
+* Goal: Real-time voice-to-voice agent for inbound customer qualification and support with low latency (<1.2s), tool execution, and session memory.
+* Budget Constraint: $0 extra cost (utilizing Free Tiers and Open Source).
+* Target Client Profile:
+   * Primary Buyer: Customer service departments, B2B sales development teams (SDRs), telehealth clinics, and high-volume appointment-based businesses (legal, real estate, automotive service centers).
+   * Who Benefits: End customers needing 24/7 instant phone assistance without waiting on hold, and sales/support managers seeking to automate tier-1 qualification and CRM scheduling.
+2. Tech Stack ($0 Budget)
+* Frontend: Next.js 15, Web Audio API / WebSockets.
+* Backend: Python 3.11+, FastAPI, AsyncWebSockets.
+* STT: Deepgram Nova-2 (Free $200 credit) / faster-whisper (local fallback).
+* LLM / Reasoning: Gemini 2.0 Flash via Google AI Studio API (Free Tier) / Groq API (Llama 3.3 70B, Free Tier).
+* TTS: edge-tts (Microsoft Edge TTS API - 100% free) / ElevenLabs Free Tier.
+* Session Memory: Redis / In-memory dict with TTL.
+3. Key Functional Requirements
+1. Streaming Audio Pipeline: Continuous bidirectional audio streaming via WebSockets.
+2. Turn Detection & Interruption (VAD): Silero VAD (local Python) or Web Audio VAD on frontend to handle user interruptions.
+3. Tool Calling / Function Execution:
+   * check_lead_qualification(email, company_size)
+   * book_calendar_slot(email, datetime)
+   * lookup_kb(query)
+4. Structured Output: Save lead summary & transcript to JSON/Postgres at call end.
+4. Non-Functional Requirements & Metrics
+* Latency: End-to-end voice latency <= 1200ms.
+* Audio Format: PCM 16kHz 16-bit mono.
+* Security: Audio stream rate-limiting, sanitized prompt inputs.
+5. Claude Code Implementation Roadmap
+* Phase 1: FastAPI WebSocket server with edge-tts and Gemini 2.0 Flash text pipeline.
+* Phase 2: Add Silero VAD and Deepgram STT stream integration.
+* Phase 3: Add Next.js frontend UI with audio visualization and tool calling handlers.
+* Phase 4: Add pytest test suite with simulated audio turns and mock API benchmarks.

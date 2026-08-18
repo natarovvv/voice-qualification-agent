@@ -1,0 +1,12 @@
+.env
+.env.local
+.env*.local
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+server/data/calls/
+server/data/leads.json
+server/data/bookings.json
+node_modules/
+.next/

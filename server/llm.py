@@ -1,0 +1,243 @@
+"""LLM reasoning + tool calling, streamed.
+
+Raw REST over httpx rather than two vendor SDKs: one dependency, one shape,
+no SDK churn. Provider order: Gemini 2.0 Flash -> Groq Llama 3.3 -> offline
+script (so the demo still runs with zero API keys).
+"""
+from __future__ import annotations
+
+import json
+import re
+import logging
+from typing import AsyncIterator, Awaitable, Callable
+
+import httpx
+
+import tools
+from config import GEMINI_API_KEY, GEMINI_MODEL, GROQ_API_KEY, GROQ_MODEL
+
+log = logging.getLogger(__name__)
+
+MAX_TOOL_ROUNDS = 3
+TIMEOUT = httpx.Timeout(30.0, connect=5.0)
+ToolSink = Callable[[str, dict, dict], Awaitable[None]]
+
+
+async def _run_tools(calls: list[dict], on_tool: ToolSink | None) -> list[dict]:
+    out = []
+    for c in calls:
+        result = tools.call(c["name"], c.get("args") or {})
+        log.info("tool %s(%s) -> %s", c["name"], c.get("args"), result.get("ok"))
+        if on_tool:
+            await on_tool(c["name"], c.get("args") or {}, result)
+        out.append({**c, "result": result})
+    return out
+
+
+class GeminiLLM:
+    name = "gemini"
+    base = "https://generativelanguage.googleapis.com/v1beta/models"
+
+    def __init__(self, client: httpx.AsyncClient, api_key: str, model: str = GEMINI_MODEL) -> None:
+        self.client, self.api_key, self.model = client, api_key, model
+
+    def _contents(self, history: list[dict]) -> list[dict]:
+        return [
+            {"role": "model" if h["role"] == "assistant" else "user", "parts": [{"text": h["content"]}]}
+            for h in history
+        ]
+
+    async def stream(self, system: str, history: list[dict], on_tool: ToolSink | None = None) -> AsyncIterator[str]:
+        contents = self._contents(history)
+        for _ in range(MAX_TOOL_ROUNDS):
+            body = {
+                "systemInstruction": {"parts": [{"text": system}]},
+                "contents": contents,
+                "tools": [{"functionDeclarations": tools.SCHEMAS}],
+                "generationConfig": {"temperature": 0.6, "maxOutputTokens": 200},
+            }
+            pending: list[dict] = []
+            model_parts: list[dict] = []
+            url = f"{self.base}/{self.model}:streamGenerateContent?alt=sse&key={self.api_key}"
+            async with self.client.stream("POST", url, json=body, timeout=TIMEOUT) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    chunk = json.loads(line[5:].strip())
+                    for cand in chunk.get("candidates", []):
+                        for part in cand.get("content", {}).get("parts", []):
+                            if "text" in part and part["text"]:
+                                model_parts.append(part)
+                                yield part["text"]
+                            elif "functionCall" in part:
+                                fc = part["functionCall"]
+                                model_parts.append(part)
+                                pending.append({"name": fc.get("name", ""), "args": fc.get("args") or {}})
+            if not pending:
+                return
+            contents.append({"role": "model", "parts": model_parts})
+            contents.append(
+                {
+                    "role": "user",
+                    "parts": [
+                        {"functionResponse": {"name": c["name"], "response": c["result"]}}
+                        for c in await _run_tools(pending, on_tool)
+                    ],
+                }
+            )
+
+    async def json_call(self, system: str, prompt: str) -> dict:
+        url = f"{self.base}/{self.model}:generateContent?key={self.api_key}"
+        body = {
+            "systemInstruction": {"parts": [{"text": system}]},
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
+        }
+        r = await self.client.post(url, json=body, timeout=TIMEOUT)
+        r.raise_for_status()
+        text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        return json.loads(text)
+
+
+class GroqLLM:
+    name = "groq"
+    url = "https://api.groq.com/openai/v1/chat/completions"
+
+    def __init__(self, client: httpx.AsyncClient, api_key: str, model: str = GROQ_MODEL) -> None:
+        self.client, self.api_key, self.model = client, api_key, model
+
+    @property
+    def _headers(self) -> dict:
+        return {"Authorization": f"Bearer {self.api_key}"}
+
+    async def stream(self, system: str, history: list[dict], on_tool: ToolSink | None = None) -> AsyncIterator[str]:
+        messages = [{"role": "system", "content": system}, *history]
+        specs = [{"type": "function", "function": s} for s in tools.SCHEMAS]
+        for _ in range(MAX_TOOL_ROUNDS):
+            body = {
+                "model": self.model,
+                "messages": messages,
+                "tools": specs,
+                "stream": True,
+                "temperature": 0.6,
+                "max_tokens": 200,
+            }
+            acc: dict[int, dict] = {}
+            text_seen = ""
+            async with self.client.stream(
+                "POST", self.url, json=body, headers=self._headers, timeout=TIMEOUT
+            ) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        break
+                    delta = json.loads(payload)["choices"][0].get("delta", {})
+                    if delta.get("content"):
+                        text_seen += delta["content"]
+                        yield delta["content"]
+                    for tc in delta.get("tool_calls") or []:
+                        slot = acc.setdefault(tc["index"], {"id": "", "name": "", "arguments": ""})
+                        slot["id"] = tc.get("id") or slot["id"]
+                        fn = tc.get("function") or {}
+                        slot["name"] = fn.get("name") or slot["name"]
+                        slot["arguments"] += fn.get("arguments") or ""
+            if not acc:
+                return
+            pending = []
+            for slot in acc.values():
+                try:
+                    args = json.loads(slot["arguments"] or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                pending.append({"name": slot["name"], "args": args, "id": slot["id"]})
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": text_seen or None,
+                    "tool_calls": [
+                        {
+                            "id": c["id"],
+                            "type": "function",
+                            "function": {"name": c["name"], "arguments": json.dumps(c["args"])},
+                        }
+                        for c in pending
+                    ],
+                }
+            )
+            for c in await _run_tools(pending, on_tool):
+                messages.append(
+                    {"role": "tool", "tool_call_id": c["id"], "content": json.dumps(c["result"])}
+                )
+
+    async def json_call(self, system: str, prompt: str) -> dict:
+        body = {
+            "model": self.model,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+            "response_format": {"type": "json_object"},
+            "temperature": 0.2,
+        }
+        r = await self.client.post(self.url, json=body, headers=self._headers, timeout=TIMEOUT)
+        r.raise_for_status()
+        return json.loads(r.json()["choices"][0]["message"]["content"])
+
+
+class OfflineLLM:
+    """No API key? Still a working demo, and the test double for the pipeline."""
+
+    name = "offline"
+
+    async def stream(self, system: str, history: list[dict], on_tool: ToolSink | None = None) -> AsyncIterator[str]:
+        last = next((h["content"] for h in reversed(history) if h["role"] == "user"), "")
+        email = next(iter(re.findall(r"[^@\s]+@[^@\s]+\.[a-z]{2,}", last.lower())), None)
+        size = tools.parse_company_size(last)
+
+        if email and size:
+            (call,) = await _run_tools([{"name": "check_lead_qualification", "args": {"email": email, "company_size": size}}], on_tool)
+            r = call["result"]
+            if r.get("qualified"):
+                yield f"Thanks. You are a {r['tier']} fit. Shall I book you a call with a specialist?"
+            else:
+                yield "Thanks, I have that noted. I will send you our self-serve guide instead."
+            return
+
+        hit = (await _run_tools([{"name": "lookup_kb", "args": {"query": last}}], on_tool))[0]["result"]
+        if hit.get("found"):
+            yield hit["results"][0]["body"]
+            yield " What is your work email and how many people are at your company?"
+            return
+        yield "I can help with that. What is your work email, and how many people work at your company?"
+
+    async def json_call(self, system: str, prompt: str) -> dict:
+        return {"outcome": "offline", "notes": "No LLM provider configured."}
+
+
+def make_llm(client: httpx.AsyncClient):
+    if GEMINI_API_KEY:
+        return GeminiLLM(client, GEMINI_API_KEY)
+    if GROQ_API_KEY:
+        return GroqLLM(client, GROQ_API_KEY)
+    log.warning("No LLM key set - running the offline script")
+    return OfflineLLM()
+
+
+SUMMARY_SYSTEM = (
+    "You are a sales ops assistant. Read a call transcript and return JSON with keys: "
+    "intent (one short phrase), summary (max 2 sentences), qualified (boolean), "
+    "next_action (one short phrase), sentiment (positive|neutral|negative)."
+)
+
+
+async def summarize(llm, transcript: list[dict], facts: dict) -> dict:
+    """Structured lead summary at call end. Never raises - it is best effort."""
+    if not transcript:
+        return {}
+    lines = "\n".join(f"{t['speaker']}: {t['text']}" for t in transcript)
+    try:
+        return await llm.json_call(SUMMARY_SYSTEM, f"Known lead data: {json.dumps(facts)}\n\nTranscript:\n{lines}")
+    except Exception as exc:  # noqa: BLE001 - a failed summary must not fail the call
+        log.warning("summary failed: %s", exc)
+        return {"error": str(exc)}

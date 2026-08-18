@@ -1,0 +1,42 @@
+[
+  {
+    "title": "Pricing",
+    "tags": ["price", "pricing", "cost", "plan", "plans", "billing", "how much"],
+    "body": "There are three plans. Starter is 49 dollars per seat per month, Growth is 89, and Enterprise is custom. Billing is monthly or annual, and annual saves fifteen percent."
+  },
+  {
+    "title": "Free trial",
+    "tags": ["trial", "free", "demo", "evaluate", "pilot"],
+    "body": "Every plan comes with a 14 day free trial. No card is needed to start, and you keep your data if you upgrade later."
+  },
+  {
+    "title": "Security and compliance",
+    "tags": ["security", "soc2", "gdpr", "compliance", "encryption", "hipaa", "data"],
+    "body": "We are SOC 2 Type 2 certified and GDPR compliant. Data is encrypted in transit and at rest, and enterprise customers can request a signed data processing agreement."
+  },
+  {
+    "title": "Integrations",
+    "tags": ["integration", "integrations", "crm", "salesforce", "hubspot", "slack", "zapier", "api"],
+    "body": "We connect to Salesforce, HubSpot, Slack and Zapier out of the box, and there is a REST API plus webhooks for anything else."
+  },
+  {
+    "title": "Support hours",
+    "tags": ["support", "hours", "help", "contact", "sla", "response"],
+    "body": "Email support runs 24 hours a day on every plan. Growth adds live chat on weekdays, and Enterprise adds a one hour response guarantee."
+  },
+  {
+    "title": "Onboarding",
+    "tags": ["onboarding", "setup", "implementation", "migration", "training"],
+    "body": "Typical setup takes about two days. Enterprise customers get a dedicated onboarding engineer and a migration from your current tool at no extra cost."
+  },
+  {
+    "title": "Cancellation and refunds",
+    "tags": ["cancel", "cancellation", "refund", "money back", "contract"],
+    "body": "You can cancel any time from the billing page. Annual plans are refunded pro rata within the first thirty days."
+  },
+  {
+    "title": "API rate limits",
+    "tags": ["api", "rate", "limit", "limits", "throttle", "requests"],
+    "body": "The API allows 100 requests per minute on Starter, 1000 on Growth, and custom limits on Enterprise. Bursts are smoothed rather than rejected."
+  }
+]

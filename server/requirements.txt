@@ -1,0 +1,19 @@
+# --- core (required) ---
+fastapi>=0.115
+uvicorn[standard]>=0.32
+httpx>=0.27
+websockets>=12
+python-dotenv>=1.0
+edge-tts>=6.1
+av>=12.0            # bundled ffmpeg: decodes edge-tts mp3 -> PCM, no system install
+
+# --- optional: better VAD (torch is ~200 MB; energy gate runs without it) ---
+silero-vad>=5.1
+
+# --- optional: local STT when there is no Deepgram key (numpy is only for this) ---
+faster-whisper>=1.0
+numpy>=1.26
+
+# --- tests ---
+pytest>=8.0
+pytest-asyncio>=0.24
