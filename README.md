@@ -28,7 +28,7 @@ browser mic ─ AudioWorklet ─► PCM16 16k ─ websocket ─► VAD ─► ST
 | [server/tools.py](server/tools.py) | The three tools + JSON schemas |
 | [server/session.py](server/session.py) | TTL session memory, sanitizing, sealed call records |
 | [server/metrics.py](server/metrics.py) | Prometheus counters and the latency histogram |
-| [server/storage.py](server/storage.py) | Leads and bookings: JSON files or Postgres |
+| [server/storage.py](server/storage.py) | Leads and bookings: sealed JSON files or Postgres |
 | [web/](web/) | Next.js 16 UI: meters, transcript, tool log, latency |
 | [web/lib/voice.ts](web/lib/voice.ts) | Mic capture, jitter buffer, barge-in, session resume |
 
@@ -70,7 +70,7 @@ Copy `.env.example` to `.env` in the repo root:
 | both LLM keys | with only one, a provider outage is a failed turn rather than a slower one |
 | `GEMINI_API_KEY` | — |
 | `DEEPGRAM_API_KEY` | STT falls back to local faster-whisper, then to none; the voice falls back to edge-tts |
-| `CALL_ENCRYPTION_KEY` | call records are written to disk in the clear, as before |
+| `CALL_ENCRYPTION_KEY` | records, leads and bookings are written to disk in the clear, as before |
 | `REDIS_URL` | sessions live in a process-local dict instead of a shared store |
 | `DATABASE_URL` | leads and bookings stay JSON files, which one process may write |
 
@@ -309,7 +309,11 @@ provider failing. Encryption is ten tests and nine more mutations: that the
 transcript and the email are not in the file, that a tampered record is refused
 rather than quietly returned, that a rotated key opens yesterday and seals
 today, and that erasure reaches inside a sealed record — and counts the ones it
-cannot open instead of passing over them.
+cannot open instead of passing over them. Sealing leads and bookings adds six
+more: that a lead is not in the file, that a plain rows file re-seals itself on
+the next write without losing the rows already in it, that the booking overlap
+still holds through the seal, and — the one that would hurt — that a rows file
+under a key we do not have is refused rather than read as empty and overwritten.
 
 Postgres is covered against a real
 PostgreSQL booted from the `pgserver` wheel, including six independent stores
@@ -336,34 +340,42 @@ off unless `DEV=1`. Before it listens anywhere else:
 
 Data and third parties, which are decisions rather than settings:
 
-- **Encryption at rest:** set `CALL_ENCRYPTION_KEY` and every call record
-  written to `server/data/calls/` is sealed with Fernet — the whole
-  transcript, the caller's email, the summary. Generate a key with:
+- **Encryption at rest:** set `CALL_ENCRYPTION_KEY` and every file this
+  server writes under `server/data/` is sealed with Fernet — call records
+  (transcript, email, summary) and, on the file backend, `leads.json` and
+  `bookings.json`. Generate a key with:
 
   ```bash
   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
   ```
 
   The setting takes a comma-separated list so a key can be rotated without a
-  migration: the **first** key seals, any of them opens. Records written before
+  migration: the **first** key seals, any of them opens. Files written before
   the key existed are still plain JSON and still read, so turning it on is not
-  a migration either — both kinds share the directory.
+  a migration either — both kinds share the directory. Leads and bookings go
+  further and re-seal themselves under the current key the next time a row is
+  added, because unlike a call record they are rewritten; a call record is
+  written once at the end of the call and never touched again.
 
   The session id stays legible, because it is the filename already and
   retention has to find a file without opening it. It is a random token, not
-  anything about the caller.
+  anything about the caller. Nothing is kept legible in the rows files: they
+  are found by their own name.
+
+  A rows file that cannot be opened — sealed under a key this process does not
+  have — raises rather than reading back as "no rows", which would let the very
+  next lead overwrite everything in it. The agent reports a tool failure it can
+  talk about, and the file is left exactly as it was.
 
   Setting the key with `cryptography` missing, or setting a key that is not a
   key, stops the process from starting. Writing plaintext you believe is
   encrypted is worse than not starting.
 
-  **What this does not cover:** leads and bookings. On the JSON backend
-  `server/data/leads.json` still holds the address in the clear, and on
-  Postgres the rows are plaintext columns — the email is indexed and the
-  booking overlap is an `EXCLUDE USING gist` constraint, and neither works on
-  ciphertext. Encrypt the volume, or use the database's own at-rest
-  encryption. The conversation is the bulk of what a call reveals and that is
-  what the key seals; the lead row is a name and a company size.
+  **What this does not cover: Postgres.** With `DATABASE_URL` set, leads and
+  bookings are plaintext columns — the email is indexed and the booking
+  overlap is an `EXCLUDE USING gist` constraint, and neither works on
+  ciphertext. That is the database's own at-rest encryption to provide, or the
+  volume's. The key covers what this server writes to files.
 
   `CALL_RETENTION_DAYS` (default 30) deletes records at startup whether sealed
   or not, and the erasure endpoint below handles a named caller.

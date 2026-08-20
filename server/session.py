@@ -78,38 +78,44 @@ def _make_cipher():
 CIPHER = _make_cipher()
 
 
-def seal(record: dict) -> dict:
-    """A call record on its way to disk.
+def seal(payload: Any, keep: dict | None = None) -> Any:
+    """Anything JSON-serialisable, on its way to disk.
 
-    The session id stays in the clear: it is already the filename, and it is a
-    random token rather than anything about the caller. Retention needs to find
-    a file without opening it, and a sealed file should say what it is.
+    ``keep`` is what stays legible beside the ciphertext. A call record keeps
+    its session id: that is the filename already, retention has to find a file
+    without opening it, and it is a random token rather than anything about
+    the caller. Leads and bookings keep nothing - the rows are the payload.
     """
     if CIPHER is None:
-        return record
-    token = CIPHER.encrypt(json.dumps(record, ensure_ascii=False).encode("utf-8"))
-    return {"session_id": record["session_id"], "enc": "fernet", "data": token.decode()}
+        return payload
+    token = CIPHER.encrypt(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+    return {**(keep or {}), "enc": "fernet", "data": token.decode()}
+
+
+def unseal(blob: Any, where: str = "record") -> Any:
+    """The inverse, for a value already loaded off disk.
+
+    Anything without the wrapper is returned as it came: written before a key
+    was configured, and still readable. That is what makes turning encryption
+    on not a migration - sealed and plain files live side by side.
+    """
+    if not (isinstance(blob, dict) and blob.get("enc")):
+        return blob
+    if CIPHER is None:
+        raise Unreadable(f"{where}: sealed, and no CALL_ENCRYPTION_KEY is set")
+    try:
+        return json.loads(CIPHER.decrypt(blob["data"].encode()))
+    except Exception as exc:  # noqa: BLE001 - InvalidToken, and anything else
+        raise Unreadable(f"{where}: {type(exc).__name__}") from exc
 
 
 def read_record(path) -> dict:
-    """A call record on its way back, sealed or not.
-
-    Records written before a key was configured are still plain JSON and still
-    read, so turning encryption on needs no migration - only new records are
-    sealed, and both kinds live in the directory together.
-    """
+    """A call record on its way back, sealed or not."""
     try:
         blob = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise Unreadable(f"{path.name}: {exc}") from exc
-    if "enc" not in blob:
-        return blob
-    if CIPHER is None:
-        raise Unreadable(f"{path.name}: sealed, and no CALL_ENCRYPTION_KEY is set")
-    try:
-        return json.loads(CIPHER.decrypt(blob["data"].encode()))
-    except Exception as exc:  # noqa: BLE001 - InvalidToken, and anything else
-        raise Unreadable(f"{path.name}: {type(exc).__name__}") from exc
+    return unseal(blob, path.name)
 
 
 def purge_old_calls(days: int = CALL_RETENTION_DAYS) -> int:
@@ -224,7 +230,7 @@ class Session:
     def save(self, summary: dict | None = None) -> dict:
         """Structured output at call end - one JSON file per call."""
         rec = self.record(summary)
-        write_json(CALLS_DIR / f"{self.id}.json", seal(rec))
+        write_json(CALLS_DIR / f"{self.id}.json", seal(rec, keep={"session_id": self.id}))
         self.ended = True
         return rec  # the caller gets their own call back; only the disk copy is sealed
 
