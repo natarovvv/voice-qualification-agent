@@ -27,6 +27,8 @@ HELP = {
     "voice_turns_total": "Turns the agent replied to.",
     "voice_turn_errors_total": "Turns that failed and got the apology line.",
     "voice_tool_calls_total": "Tool calls the agent made.",
+    "voice_llm_errors_total": "LLM requests that failed, by provider.",
+    "voice_llm_failovers_total": "Turns handed to the second provider, by who took over.",
     LATENCY: "Caller stopped talking -> first byte of audio out.",
 }
 
