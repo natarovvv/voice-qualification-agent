@@ -21,6 +21,13 @@ SAMPLE_RATE = 16000
 SAMPLE_WIDTH = 2
 BYTES_PER_SEC = SAMPLE_RATE * SAMPLE_WIDTH
 
+# --- echo guard: the agent's own voice coming back through the speakers ---
+# Room-dependent, so they are knobs. ECHO_THRESHOLD at 0.5 disables the duck
+# (right for a headset); raise it in a room with loud speakers.
+ECHO_THRESHOLD = float(os.getenv("ECHO_THRESHOLD", "0.85"))
+ECHO_START_MS = int(os.getenv("ECHO_START_MS", "400"))
+ECHO_TAIL = int(os.getenv("ECHO_TAIL_MS", "250")) / 1000  # speaker + jitter buffer
+
 # --- limits ---
 SESSION_TTL = int(os.getenv("SESSION_TTL", "1800"))          # seconds
 MAX_TURN_CHARS = 2000                                        # sanitize user text

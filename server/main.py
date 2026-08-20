@@ -21,10 +21,10 @@ from fastapi.middleware.cors import CORSMiddleware
 
 import llm as llm_mod
 import tts
-from config import BYTES_PER_SEC, RATE_LIMIT_FACTOR, SYSTEM_PROMPT
+from config import BYTES_PER_SEC, ECHO_TAIL, RATE_LIMIT_FACTOR, SYSTEM_PROMPT
 from session import STORE, sanitize
 from stt import make_stt
-from vad import SpeechGate
+from vad import SpeechGate, pcm_seconds
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("voice")
@@ -80,6 +80,7 @@ class Call:
         self.finisher: asyncio.Task | None = None
         self.pending: list[str] = []
         self.turn_start = 0.0
+        self.play_until = 0.0  # monotonic time the room stops hearing our own voice
         self.closed = False
 
     # ---------- outbound ----------
@@ -95,6 +96,8 @@ class Call:
         if not self.closed:
             try:
                 await self.ws.send_bytes(pcm)
+                # the client is still playing this out after the last byte leaves
+                self.play_until = max(self.play_until, time.monotonic()) + pcm_seconds(pcm)
             except (WebSocketDisconnect, RuntimeError):
                 self.closed = True
 
@@ -155,6 +158,7 @@ class Call:
     async def interrupt(self) -> None:
         if self.speaking and not self.speaking.done():
             self.speaking.cancel()
+            self.play_until = 0.0  # the client drops its queue on this message
             await self.send(type="interrupt")
 
     async def _finish_turn(self) -> None:
@@ -174,6 +178,7 @@ class Call:
         if not self.limiter.allow(len(pcm)):
             await self.send(type="error", message="audio rate limit exceeded")
             raise WebSocketDisconnect(code=1008)
+        self.gate.echo = time.monotonic() < self.play_until + ECHO_TAIL
         for event in self.gate.update(pcm):
             if event == "start":
                 if self.finisher and not self.finisher.done():
@@ -183,6 +188,10 @@ class Call:
                 self.turn_start = time.monotonic()
                 await self.stt.endpoint()
                 self.schedule_turn()
+        if self.gate.echo and not self.gate.active:
+            # ponytail: drops the first ~ECHO_START_MS of a real barge-in too.
+            # Cheaper than a hold buffer, and the caller keeps talking anyway.
+            return  # our own voice: transcribing it would make the agent answer itself
         await self.stt.send(pcm)
 
     async def stt_loop(self) -> None:

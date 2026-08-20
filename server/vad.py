@@ -9,7 +9,7 @@ import array
 import logging
 import math
 
-from config import SAMPLE_RATE
+from config import ECHO_START_MS, ECHO_THRESHOLD, SAMPLE_RATE
 
 log = logging.getLogger(__name__)
 
@@ -63,6 +63,9 @@ class SpeechGate:
     """Turns a byte stream of PCM16 into 'start' / 'end' speech events.
 
     ``update`` accepts any chunk size; it buffers to WINDOW internally.
+
+    Set ``echo`` while the agent's own voice is playing into the room: the
+    gate then wants louder speech for longer before it calls it a barge-in.
     """
 
     def __init__(
@@ -70,11 +73,16 @@ class SpeechGate:
         threshold: float = 0.5,
         start_ms: int = 120,
         end_ms: int = 500,
+        echo_threshold: float = ECHO_THRESHOLD,
+        echo_start_ms: int = ECHO_START_MS,
     ) -> None:
         self.det = _make_detector(threshold)
         self.frame_ms = WINDOW * 1000 // SAMPLE_RATE  # 32 ms
         self.start_frames = max(1, start_ms // self.frame_ms)
         self.end_frames = max(1, end_ms // self.frame_ms)
+        self.echo_threshold = echo_threshold
+        self.echo_start_frames = max(1, echo_start_ms // self.frame_ms)
+        self.echo = False
         self._buf = bytearray()
         self._speech = 0
         self._silence = 0
@@ -85,17 +93,21 @@ class SpeechGate:
         events: list[str] = []
         self._buf.extend(pcm)
         step = WINDOW * 2
+        # ponytail: a duck, not acoustic echo cancellation. It costs nothing and
+        # stops the speaker-to-mic loop; add real AEC only if a room defeats it.
+        threshold = max(self.det.threshold, self.echo_threshold) if self.echo else self.det.threshold
+        start_frames = self.echo_start_frames if self.echo else self.start_frames
         while len(self._buf) >= step:
             window = array.array("h", bytes(self._buf[:step]))
             del self._buf[:step]
-            voiced = self.det.prob(window) >= self.det.threshold
+            voiced = self.det.prob(window) >= threshold
             if voiced:
                 self._speech += 1
                 self._silence = 0
             else:
                 self._silence += 1
                 self._speech = 0
-            if not self.active and self._speech >= self.start_frames:
+            if not self.active and self._speech >= start_frames:
                 self.active = True
                 events.append("start")
             elif self.active and self._silence >= self.end_frames:

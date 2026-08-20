@@ -158,6 +158,27 @@ def test_vad_ignores_a_single_click():
     assert gate.update(tone(0.02)) == []  # shorter than start_ms
 
 
+# amplitude the energy gate scores at ~0.65: over the normal 0.5 threshold,
+# under the 0.85 the echo guard demands. Stands in for the agent's own voice
+# coming back off the speakers.
+ECHO_LEVEL = 300
+
+
+def test_room_level_speech_opens_the_gate_normally():
+    gate = energy_gate()
+    gate.update(silence(1.5))  # let the noise floor settle
+    assert "start" in gate.update(tone(0.6, amplitude=ECHO_LEVEL))
+
+
+def test_echo_guard_ducks_the_gate_while_the_agent_speaks():
+    gate = energy_gate()
+    gate.update(silence(1.5))
+    gate.echo = True
+    assert gate.update(tone(0.6, amplitude=ECHO_LEVEL)) == [], "self-interruption loop"
+    assert not gate.active
+    assert "start" in gate.update(tone(0.6)), "a caller who really talks over it still cuts in"
+
+
 # ------------------------------------------------------------ sentence chunker
 
 
@@ -301,6 +322,37 @@ def test_barge_in_cancels_the_agent_mid_sentence(client):
         assert interrupt["type"] == "interrupt"
         assert any(s.get("type") == "assistant" for s in seen), "greeting had started"
         ws.send_text(json.dumps({"type": "end"}))
+
+
+class StubWS:
+    """Just enough websocket for Call to talk into."""
+
+    async def send_text(self, text: str):
+        pass
+
+    async def send_bytes(self, data: bytes):
+        pass
+
+
+def test_own_audio_opens_the_echo_window_and_it_closes(monkeypatch):
+    import main
+
+    stt = FakeSTT()
+    monkeypatch.setattr(main, "make_stt", lambda: stt)
+    call = main.Call(StubWS(), session_mod.Session(id="echo"), None)
+
+    async def drive():
+        assert not call.gate.echo
+        await call.send_audio(silence(0.05))  # the agent speaks
+        await call.on_audio(tone(0.032, amplitude=ECHO_LEVEL))
+        assert call.gate.echo
+        assert stt.audio_bytes == 0, "the agent transcribed its own voice"
+        await asyncio.sleep(0.05 + main.ECHO_TAIL + 0.05)  # the room goes quiet (+ timer slack)
+        await call.on_audio(tone(0.032, amplitude=ECHO_LEVEL))
+        assert not call.gate.echo
+        assert stt.audio_bytes > 0
+
+    asyncio.run(drive())
 
 
 def test_typed_turn_latency_under_budget(client):
