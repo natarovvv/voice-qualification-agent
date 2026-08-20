@@ -134,6 +134,13 @@ Measured on this machine. Orchestration only, with providers mocked:
 The cold number is DNS + TLS to Microsoft. `tts.prewarm()` runs at startup so a
 caller never pays it.
 
+Opening the socket to the first byte of the greeting: **330–450 ms**. The
+greeting is spoken before the Deepgram handshake, not after it — that
+handshake is most of a second and the caller has nothing to say yet.
+
+On a spoken turn the transcriber's own endpoint decision ends the turn
+immediately; `ENDPOINT_GRACE` is only spent when nothing endpointed for us.
+
 Against the real providers (Groq + edge-tts, typed input → first PCM byte):
 
 | turn | measured |

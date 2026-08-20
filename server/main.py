@@ -122,6 +122,7 @@ class Call:
                     type="metric",
                     first_audio_ms=round((time.monotonic() - self.turn_start) * 1000),
                 )
+                self.turn_start = 0.0  # a stale one would time the whole last turn
                 first = False
             await self.send_audio(pcm)
 
@@ -161,18 +162,18 @@ class Call:
             self.play_until = 0.0  # the client drops its queue on this message
             await self.send(type="interrupt")
 
-    async def _finish_turn(self) -> None:
+    async def _finish_turn(self, grace: float) -> None:
         """Fire after the grace period; whatever transcript arrived is the turn."""
-        await asyncio.sleep(ENDPOINT_GRACE)
+        await asyncio.sleep(grace)
         text = sanitize(" ".join(self.pending).strip())
         self.pending.clear()
         if text:
             self.speaking = asyncio.create_task(self.respond(text))
 
-    def schedule_turn(self) -> None:
+    def schedule_turn(self, grace: float = ENDPOINT_GRACE) -> None:
         if self.finisher and not self.finisher.done():
             self.finisher.cancel()
-        self.finisher = asyncio.create_task(self._finish_turn())
+        self.finisher = asyncio.create_task(self._finish_turn(grace))
 
     async def on_audio(self, pcm: bytes) -> None:
         if not self.limiter.allow(len(pcm)):
@@ -185,7 +186,9 @@ class Call:
                     self.finisher.cancel()
                 await self.interrupt()
             else:  # "end"
-                self.turn_start = time.monotonic()
+                # whichever endpoints first starts the clock - Deepgram's own
+                # decision often beats our VAD, and it must not go unmeasured
+                self.turn_start = self.turn_start or time.monotonic()
                 await self.stt.endpoint()
                 self.schedule_turn()
         if self.gate.echo and not self.gate.active:
@@ -202,7 +205,12 @@ class Call:
                 await self.send(type="partial", text=event["text"])
             else:
                 self.pending.append(event["text"])
-                if not self.gate.active:  # silence already detected: go now
+                if event.get("ended"):
+                    self.turn_start = self.turn_start or time.monotonic()
+                    # the transcriber endpointed the utterance itself; waiting
+                    # out our own grace on top of that is pure added latency
+                    self.schedule_turn(grace=0)
+                elif not self.gate.active:  # silence already detected: go now
                     self.schedule_turn()
 
     async def hangup(self):
@@ -221,13 +229,20 @@ async def voice_ws(ws: WebSocket) -> None:
     await ws.accept()
     session = STORE.get(ws.query_params.get("session_id"))
     call = Call(ws, session, app.state.llm)
-    await call.stt.start()
     await call.send(
         type="ready", session_id=session.id, stt=call.stt.name, llm=call.llm.name, sample_rate=16000
     )
     reader = asyncio.create_task(call.stt_loop())
+    # Greet before connecting the transcriber, not after: that handshake is
+    # most of a second and the caller cannot say anything worth hearing until
+    # the greeting is out. Audio arriving early is dropped by an unstarted
+    # stream, which costs nothing.
     call.speaking = asyncio.create_task(call.say(GREETING))
     call.session.add_turn("assistant", GREETING)
+    try:
+        await call.stt.start()
+    except Exception:  # noqa: BLE001 - a dead transcriber must not refuse the call
+        log.exception("stt failed to start; typed turns still work")
 
     try:
         while True:

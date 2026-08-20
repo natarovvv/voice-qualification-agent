@@ -360,6 +360,39 @@ def test_own_audio_opens_the_echo_window_and_it_closes(monkeypatch):
     asyncio.run(drive())
 
 
+def drive_one_final(monkeypatch, event: dict, wait: float) -> list[str]:
+    """Feed one transcript event to a Call and see if it answers within `wait`."""
+    import main
+
+    monkeypatch.setattr(main, "make_stt", lambda: FakeSTT())
+    call = main.Call(StubWS(), session_mod.Session(id="grace"), None)
+    said: list[str] = []
+
+    async def fake_respond(text):
+        said.append(text)
+
+    call.respond = fake_respond
+
+    async def drive():
+        reader = asyncio.create_task(call.stt_loop())
+        await call.stt.events.put(event)
+        await asyncio.sleep(wait)
+        reader.cancel()
+
+    asyncio.run(drive())
+    return said
+
+
+def test_provider_endpoint_answers_without_our_grace(monkeypatch):
+    import main
+
+    half = main.ENDPOINT_GRACE / 2
+    ended = {"type": "final", "text": "book me a slot", "ended": True}
+    assert drive_one_final(monkeypatch, ended, half) == ["book me a slot"]
+    # without the provider's own endpoint we still wait out the grace
+    assert drive_one_final(monkeypatch, {**ended, "ended": False}, half) == []
+
+
 def test_typed_turn_latency_under_budget(client):
     """Benchmark with mocked providers: what the orchestration itself costs."""
     with client.websocket_connect("/ws?session_id=bench") as ws:

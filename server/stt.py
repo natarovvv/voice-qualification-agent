@@ -59,8 +59,13 @@ class DeepgramSTT:
                 text = (alt.get("transcript") or "").strip()
                 if not text:
                     continue
-                final = bool(msg.get("speech_final") or msg.get("is_final"))
-                await self.events.put({"type": "final" if final else "partial", "text": text})
+                # speech_final is Deepgram's own endpoint decision; is_final
+                # only settles a segment and more may still be coming.
+                ended = bool(msg.get("speech_final"))
+                final = ended or bool(msg.get("is_final"))
+                await self.events.put(
+                    {"type": "final" if final else "partial", "text": text, "ended": ended}
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - connection drops end the stream
@@ -131,7 +136,8 @@ class WhisperSTT:
         try:
             text = await asyncio.to_thread(self._transcribe, audio)
             if text:
-                await self.events.put({"type": "final", "text": text})
+                # it only runs on the VAD endpoint, so the utterance is over
+                await self.events.put({"type": "final", "text": text, "ended": True})
         finally:
             self._busy = False
 
