@@ -75,6 +75,12 @@ MAX_CALLS = int(os.getenv("MAX_CALLS", "20"))                # concurrent websoc
 MAX_TEXT_TURNS = 10                                          # typed turns per window
 TEXT_WINDOW = 10.0                                           # seconds
 CALL_RETENTION_DAYS = int(os.getenv("CALL_RETENTION_DAYS", "30"))  # 0 = keep forever
+# Fernet keys for the call records on disk. Comma-separated to rotate: the
+# first one seals, any of them opens, so yesterday's records stay readable.
+# Unset means records are written in the clear, which is what they were before
+# this existed. Generate one with:
+#   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+CALL_ENCRYPTION_KEYS = [k.strip() for k in os.getenv("CALL_ENCRYPTION_KEY", "").split(",") if k.strip()]
 
 DATA_DIR = Path(os.getenv("DATA_DIR", Path(__file__).resolve().parent / "data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)

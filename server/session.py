@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from config import (
+    CALL_ENCRYPTION_KEYS,
     CALL_RETENTION_DAYS,
     DATA_DIR,
     MAX_HISTORY_TURNS,
@@ -46,6 +47,69 @@ _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 # a drive letter. Checked once, at construction, so every path built from an
 # id downstream is safe by construction rather than by remembering to check.
 _SAFE_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+class Unreadable(Exception):
+    """A record on disk this process cannot open: truncated, or sealed with a
+    key this deployment does not have. Either way its contents are unknown,
+    which matters most to erasure - an unreadable record is one not erased."""
+
+
+def _make_cipher():
+    """The cipher for call records, or None when no key is configured.
+
+    Fernet: AES-CBC with an HMAC over the ciphertext, from a library that is
+    audited. Rolling our own is the one thing here that would be indefensible.
+    MultiFernet takes the list so a key can be rotated without a migration -
+    the first key seals, any of them opens.
+    """
+    if not CALL_ENCRYPTION_KEYS:
+        return None
+    try:
+        from cryptography.fernet import Fernet, MultiFernet
+    except ImportError as exc:  # refuse to start rather than quietly not encrypt
+        raise RuntimeError(
+            "CALL_ENCRYPTION_KEY is set but cryptography is not installed. "
+            "Writing plaintext you believe is encrypted is worse than not starting."
+        ) from exc
+    return MultiFernet([Fernet(k) for k in CALL_ENCRYPTION_KEYS])
+
+
+CIPHER = _make_cipher()
+
+
+def seal(record: dict) -> dict:
+    """A call record on its way to disk.
+
+    The session id stays in the clear: it is already the filename, and it is a
+    random token rather than anything about the caller. Retention needs to find
+    a file without opening it, and a sealed file should say what it is.
+    """
+    if CIPHER is None:
+        return record
+    token = CIPHER.encrypt(json.dumps(record, ensure_ascii=False).encode("utf-8"))
+    return {"session_id": record["session_id"], "enc": "fernet", "data": token.decode()}
+
+
+def read_record(path) -> dict:
+    """A call record on its way back, sealed or not.
+
+    Records written before a key was configured are still plain JSON and still
+    read, so turning encryption on needs no migration - only new records are
+    sealed, and both kinds live in the directory together.
+    """
+    try:
+        blob = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise Unreadable(f"{path.name}: {exc}") from exc
+    if "enc" not in blob:
+        return blob
+    if CIPHER is None:
+        raise Unreadable(f"{path.name}: sealed, and no CALL_ENCRYPTION_KEY is set")
+    try:
+        return json.loads(CIPHER.decrypt(blob["data"].encode()))
+    except Exception as exc:  # noqa: BLE001 - InvalidToken, and anything else
+        raise Unreadable(f"{path.name}: {type(exc).__name__}") from exc
 
 
 def purge_old_calls(days: int = CALL_RETENTION_DAYS) -> int:
@@ -160,9 +224,9 @@ class Session:
     def save(self, summary: dict | None = None) -> dict:
         """Structured output at call end - one JSON file per call."""
         rec = self.record(summary)
-        write_json(CALLS_DIR / f"{self.id}.json", rec)
+        write_json(CALLS_DIR / f"{self.id}.json", seal(rec))
         self.ended = True
-        return rec
+        return rec  # the caller gets their own call back; only the disk copy is sealed
 
 
 def _new_session() -> Session:
