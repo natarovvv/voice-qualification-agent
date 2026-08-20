@@ -11,3 +11,6 @@ server/data/bookings.json
 node_modules/
 .next/
 tsconfig.tsbuildinfo
+
+# Claude Code permission grants: machine-local, not the team's business
+.claude/settings.local.json
