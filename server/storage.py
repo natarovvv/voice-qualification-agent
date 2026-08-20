@@ -24,7 +24,7 @@ from datetime import datetime
 from typing import Any
 
 from config import DATABASE_URL, DATA_DIR
-from session import write_json
+from session import Unreadable, seal, unseal, write_json
 
 log = logging.getLogger(__name__)
 
@@ -74,12 +74,19 @@ class JsonStore:
 
     def _load(self, name: str) -> list:
         try:
-            return json.loads(self._path(name).read_text(encoding="utf-8"))
+            blob = json.loads(self._path(name).read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError):
             return []
+        # Deliberately not caught: a file sealed with a key this process does
+        # not have must not read back as "no rows", or the next add_lead would
+        # write a fresh list over the top of it. tools.call turns this into a
+        # tool failure the agent can talk about, and nothing is written.
+        return unseal(blob, f"{name}.json")
 
     def _save(self, name: str, rows: list) -> None:
-        write_json(self._path(name), rows[-MAX_RECORDS:])
+        # Nothing is kept legible here: unlike a call record, the file is found
+        # by its own name and nothing needs to identify a row without the key.
+        write_json(self._path(name), seal(rows[-MAX_RECORDS:]))
 
     def add_lead(self, record: dict) -> None:
         with self._lock:

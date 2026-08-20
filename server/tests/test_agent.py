@@ -23,6 +23,7 @@ import llm
 import main as main_mod
 import metrics
 import session as session_mod
+import storage
 import tools
 import tts
 import vad
@@ -1140,9 +1141,16 @@ def new_key() -> str:
 
 
 @pytest.fixture
-def sealed(monkeypatch):
-    """Records encrypted for the length of one test, under a key of its own."""
+def sealed(monkeypatch, tmp_path):
+    """Records encrypted for the length of one test, under a key of its own.
+
+    The JSON store gets its own directory with it. A leads.json sealed under a
+    throwaway key is unreadable to every test that runs afterwards - which is
+    precisely what encryption is for, and precisely why the key and the data
+    have to travel together.
+    """
     monkeypatch.setattr(session_mod, "CIPHER", cipher_for(new_key()))
+    monkeypatch.setattr(storage, "DATA_DIR", tmp_path)
 
 
 def test_a_sealed_record_never_reaches_the_disk_in_the_clear(sealed):
@@ -1277,6 +1285,69 @@ def test_no_key_means_the_records_are_written_the_way_they_always_were(monkeypat
     monkeypatch.setattr(session_mod, "CIPHER", None)
     record = {"session_id": "plain-two", "lead": {"email": "x@acme.io"}}
     assert session_mod.seal(record) is record
+
+def test_a_lead_never_reaches_the_disk_in_the_clear_either(sealed, tmp_path):
+    tools.check_lead_qualification("cfo@acme-corp.io", "600")
+
+    raw = (tmp_path / "leads.json").read_text(encoding="utf-8")
+    assert "cfo@acme-corp.io" not in raw
+    assert json.loads(raw)["enc"] == "fernet"
+    assert storage.STORAGE._load("leads")[-1]["email"] == "cfo@acme-corp.io"
+
+
+def test_a_plain_lead_file_seals_itself_on_the_next_write(sealed, tmp_path):
+    """Leads and bookings migrate themselves, because they are rewritten. A
+    call record never is - it is written once at the end of the call and never
+    touched again, so the old ones simply stay plain and stay readable."""
+    session_mod.write_json(tmp_path / "leads.json", [{"email": "already@acme-corp.io"}])
+
+    tools.check_lead_qualification("new@acme-corp.io", "600")
+
+    raw = (tmp_path / "leads.json").read_text(encoding="utf-8")
+    assert json.loads(raw)["enc"] == "fernet"
+    assert "already@acme-corp.io" not in raw
+    assert [r["email"] for r in storage.STORAGE._load("leads")] == [
+        "already@acme-corp.io",
+        "new@acme-corp.io",
+    ]
+
+
+def test_a_booking_still_refuses_an_overlap_through_the_seal(sealed):
+    """The calendar reads every row back to answer "is this free". Sealing the
+    file must not cost the one invariant the file backend still holds."""
+    slot = next_weekday_slot(hour=11, days_ahead=3)
+    assert tools.book_calendar_slot("one@acme-corp.io", slot)["ok"]
+
+    second = tools.book_calendar_slot("two@acme-corp.io", slot)
+    assert not second["ok"] and second["error"] == "slot_taken"
+
+
+def test_a_lead_file_under_a_key_we_do_not_have_is_not_overwritten(sealed, tmp_path, monkeypatch):
+    """Reading a sealed file back as "no rows" would let the next write drop
+    everything in it. A tool failure the agent can talk about is the right
+    outcome; a file quietly emptied by a key rotation gone wrong is not."""
+    tools.check_lead_qualification("first@acme-corp.io", "600")
+    before = (tmp_path / "leads.json").read_bytes()
+
+    monkeypatch.setattr(session_mod, "CIPHER", cipher_for(new_key()))
+    result = tools.call(
+        "check_lead_qualification", {"email": "second@acme-corp.io", "company_size": "600"}
+    )
+
+    assert not result["ok"] and result["error"] == "tool_failed"
+    assert (tmp_path / "leads.json").read_bytes() == before
+
+
+def test_erasure_reaches_a_sealed_lead_and_seals_what_is_left(sealed, tmp_path):
+    tools.check_lead_qualification("gone@acme-corp.io", "600")
+    tools.check_lead_qualification("stays@acme-corp.io", "600")
+
+    removed = storage.STORAGE.erase("gone@acme-corp.io")
+
+    assert removed["leads"] == 1
+    assert [r["email"] for r in storage.STORAGE._load("leads")] == ["stays@acme-corp.io"]
+    # and the rewrite did not put the survivors back in the clear
+    assert json.loads((tmp_path / "leads.json").read_text(encoding="utf-8"))["enc"] == "fernet"
 
 
 def test_erase_needs_the_token_and_refuses_when_none_is_configured(client, monkeypatch):
