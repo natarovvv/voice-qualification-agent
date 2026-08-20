@@ -55,7 +55,7 @@ async def lifespan(app: FastAPI):
     app.state.llm = llm_mod.make_llm(app.state.http)
     app.state.calls = 0
     asyncio.create_task(tts.prewarm())  # pay the TLS handshake before a caller does
-    log.info("llm provider: %s", app.state.llm.name)
+    log.info("llm provider: %s | sessions: %s", app.state.llm.name, STORE.name)
     log.info("retention: purged %s expired call records", purge_old_calls())
     if not AUTH_TOKEN and HOST not in ("127.0.0.1", "localhost", "::1"):
         log.warning(
@@ -230,6 +230,9 @@ class Call:
         finally:
             if spoken:
                 self.session.add_turn("assistant", " ".join(spoken))
+            # Persist the finished turn. A turn the caller talked over is
+            # cancelled here and skips this; the next one writes it anyway.
+            await STORE.put(self.session)
 
     # ---------- turn taking ----------
 
@@ -306,6 +309,7 @@ class Call:
             return
         summary = await llm_mod.summarize(self.llm, self.session.transcript, self.session.facts)
         record = self.session.save(summary)
+        await STORE.drop(self.session.id)  # the record is on disk now
         log.info("call %s saved: %s turns", self.session.id, len(record["transcript"]))
         return record
 
@@ -321,7 +325,7 @@ async def voice_ws(ws: WebSocket) -> None:
         return
     app.state.calls += 1
     await ws.accept()
-    session = STORE.get(ws.query_params.get("session_id"))
+    session = await STORE.get(ws.query_params.get("session_id"))
     call = Call(ws, session, app.state.llm)
     await call.send(
         type="ready",
