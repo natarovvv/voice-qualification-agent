@@ -191,6 +191,7 @@ class Call:
         if self.gate.echo and not self.gate.active:
             # ponytail: drops the first ~ECHO_START_MS of a real barge-in too.
             # Cheaper than a hold buffer, and the caller keeps talking anyway.
+            await self.stt.keepalive()
             return  # our own voice: transcribing it would make the agent answer itself
         await self.stt.send(pcm)
 

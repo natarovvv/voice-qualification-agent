@@ -42,8 +42,13 @@ cd web && npm install && npm run dev
 ```
 
 Open http://localhost:3000 and hit **Start call**. Grant the mic. You can also
-type a turn — it goes through the identical server pipeline, which is the
-quickest way to test tool calling without talking.
+type a turn and hit **Send** — it goes through the identical server pipeline,
+which is the quickest way to test tool calling without talking.
+
+Denying the mic does not end the call: the agent still speaks and typed turns
+still work, which is how you test on a box with no microphone. **End call**
+waits for the call record, so it takes a few seconds — that is an LLM round
+trip writing the summary.
 
 ### Keys (all optional)
 

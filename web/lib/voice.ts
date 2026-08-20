@@ -47,6 +47,7 @@ export class VoiceClient {
   private queued: AudioBufferSourceNode[] = [];
   private playAt = 0;
   private raf = 0;
+  private summaryArrived?: () => void;
 
   constructor(private url: string, private h: Handlers) {}
 
@@ -55,16 +56,24 @@ export class VoiceClient {
     this.ctx = new AudioContext({ sampleRate: SAMPLE_RATE });
     await this.ctx.audioWorklet.addModule("/capture-worklet.js");
 
-    this.mic = await navigator.mediaDevices.getUserMedia({
-      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-    });
-
-    const src = this.ctx.createMediaStreamSource(this.mic);
-    this.micAnalyser = this.ctx.createAnalyser();
-    this.micAnalyser.fftSize = 512;
-    this.node = new AudioWorkletNode(this.ctx, "capture");
-    src.connect(this.micAnalyser);
-    src.connect(this.node);
+    // No mic is not a dead call: typed turns run the same server pipeline, and
+    // the agent's audio still plays. Denying the mic must not cost you both.
+    try {
+      this.mic = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+      const src = this.ctx.createMediaStreamSource(this.mic);
+      this.micAnalyser = this.ctx.createAnalyser();
+      this.micAnalyser.fftSize = 512;
+      this.node = new AudioWorkletNode(this.ctx, "capture");
+      src.connect(this.micAnalyser);
+      src.connect(this.node);
+    } catch (err) {
+      this.h.onEvent({
+        type: "error",
+        message: `no microphone (${(err as Error).message}) - typed turns only`,
+      });
+    }
 
     this.outGain = this.ctx.createGain();
     this.outAnalyser = this.ctx.createAnalyser();
@@ -78,15 +87,18 @@ export class VoiceClient {
 
     this.ws.onopen = () => {
       this.h.onState("live");
-      this.node!.port.onmessage = (ev) => {
-        if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(ev.data as Int16Array);
-      };
+      if (this.node) {
+        this.node.port.onmessage = (ev) => {
+          if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(ev.data as Int16Array);
+        };
+      }
       this.meter();
     };
     this.ws.onmessage = (ev) => {
       if (typeof ev.data === "string") {
         const msg = JSON.parse(ev.data) as ServerEvent;
         if (msg.type === "interrupt") this.stopPlayback();
+        if (msg.type === "summary") this.summaryArrived?.();
         this.h.onEvent(msg);
       } else {
         this.enqueue(new Int16Array(ev.data as ArrayBuffer));
@@ -135,25 +147,30 @@ export class VoiceClient {
   }
 
   private meter() {
-    const micData = new Uint8Array(this.micAnalyser!.frequencyBinCount);
+    const micData = new Uint8Array(this.micAnalyser?.frequencyBinCount ?? 0);
     const outData = new Uint8Array(this.outAnalyser!.frequencyBinCount);
     const tick = () => {
-      this.micAnalyser!.getByteTimeDomainData(micData);
+      this.micAnalyser?.getByteTimeDomainData(micData);
       this.outAnalyser!.getByteTimeDomainData(outData);
-      this.h.onLevels(rms(micData), rms(outData));
+      this.h.onLevels(this.micAnalyser ? rms(micData) : 0, rms(outData));
       this.raf = requestAnimationFrame(tick);
     };
     tick();
   }
 
   async stop() {
+    this.h.onState("closed");  // the wait for the record below is seconds long
     cancelAnimationFrame(this.raf);
     this.stopPlayback();
     if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: "end" }));
     this.mic?.getTracks().forEach((t) => t.stop());
     this.node?.disconnect();
-    // give the server a moment to send the call summary before we hang up
-    await new Promise((r) => setTimeout(r, 600));
+    // wait for the call record, don't guess at how long the summary takes:
+    // it is an LLM round trip and runs several seconds behind the hangup
+    await new Promise<void>((resolve) => {
+      this.summaryArrived = resolve;
+      setTimeout(resolve, 15000);
+    });
     this.ws?.close();
     await this.ctx?.close();
     this.h.onState("idle");

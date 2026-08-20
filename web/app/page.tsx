@@ -154,8 +154,9 @@ export default function Home() {
           onSubmit={(ev) => {
             ev.preventDefault();
             if (!typed.trim() || !live) return;
+            // no optimistic line: the server echoes a typed turn back as
+            // `final`, exactly like a spoken one, and two would show up
             clientRef.current?.sendText(typed.trim());
-            setLines((l) => [...l, { who: "caller", text: typed.trim() }]);
             setTyped("");
           }}
         >
@@ -165,6 +166,11 @@ export default function Home() {
             placeholder={live ? "…or type a turn instead" : "Start the call first"}
             disabled={!live}
           />
+          {/* a real submit button, not implicit Enter: Enter alone does not
+              submit a form without one everywhere, and phones need the tap */}
+          <button type="submit" disabled={!live || !typed.trim()}>
+            Send
+          </button>
         </form>
         {latency.length > 0 && (
           <span className={`pill ${worst <= 1200 ? "on" : "warn"}`}>

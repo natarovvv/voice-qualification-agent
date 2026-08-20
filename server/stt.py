@@ -12,6 +12,7 @@ import asyncio
 import importlib.util
 import json
 import logging
+import time
 
 from config import DEEPGRAM_API_KEY, SAMPLE_RATE, WHISPER_MODEL
 
@@ -28,12 +29,14 @@ MAX_UTTERANCE_SEC = 30
 
 class DeepgramSTT:
     name = "deepgram"
+    KEEPALIVE_SEC = 5  # Deepgram closes the socket after ~10 s of nothing
 
     def __init__(self, api_key: str = DEEPGRAM_API_KEY) -> None:
         self.api_key = api_key
         self.events: asyncio.Queue = asyncio.Queue()
         self._ws = None
         self._reader: asyncio.Task | None = None
+        self._last_sent = 0.0
 
     async def start(self) -> None:
         import websockets
@@ -65,7 +68,16 @@ class DeepgramSTT:
 
     async def send(self, pcm: bytes) -> None:
         if self._ws:
+            self._last_sent = time.monotonic()
             await self._ws.send(pcm)
+
+    async def keepalive(self) -> None:
+        """Hold the socket open while we are deliberately not sending audio -
+        the echo guard withholds the microphone for as long as the agent talks,
+        which is easily past Deepgram's idle timeout."""
+        if self._ws and time.monotonic() - self._last_sent > self.KEEPALIVE_SEC:
+            self._last_sent = time.monotonic()
+            await self._ws.send(json.dumps({"type": "KeepAlive"}))
 
     async def endpoint(self) -> None:
         """Deepgram does its own endpointing."""
@@ -108,6 +120,9 @@ class WhisperSTT:
         if len(self._buf) > limit:
             del self._buf[: len(self._buf) - limit]
 
+    async def keepalive(self) -> None:
+        """Local model, nothing to keep alive."""
+
     async def endpoint(self) -> None:
         audio, self._buf = bytes(self._buf), bytearray()
         if self._busy or len(audio) < SAMPLE_RATE:  # under ~0.5 s is a cough
@@ -144,6 +159,9 @@ class NullSTT:
         log.warning("STT: none available - set DEEPGRAM_API_KEY or pip install faster-whisper")
 
     async def send(self, pcm: bytes):
+        pass
+
+    async def keepalive(self):
         pass
 
     async def endpoint(self):

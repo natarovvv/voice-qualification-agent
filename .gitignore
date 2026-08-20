@@ -10,3 +10,4 @@ server/data/leads.json
 server/data/bookings.json
 node_modules/
 .next/
+tsconfig.tsbuildinfo

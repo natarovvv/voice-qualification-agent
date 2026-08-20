@@ -218,6 +218,7 @@ class FakeSTT:
     def __init__(self) -> None:
         self.events: asyncio.Queue = asyncio.Queue()
         self.audio_bytes = 0
+        self.keepalives = 0
         self._i = 0
 
     async def start(self):
@@ -225,6 +226,9 @@ class FakeSTT:
 
     async def send(self, pcm: bytes):
         self.audio_bytes += len(pcm)
+
+    async def keepalive(self):
+        self.keepalives += 1
 
     async def endpoint(self):
         if self._i < len(self.script):
@@ -347,6 +351,7 @@ def test_own_audio_opens_the_echo_window_and_it_closes(monkeypatch):
         await call.on_audio(tone(0.032, amplitude=ECHO_LEVEL))
         assert call.gate.echo
         assert stt.audio_bytes == 0, "the agent transcribed its own voice"
+        assert stt.keepalives == 1, "withholding audio must not let the STT socket time out"
         await asyncio.sleep(0.05 + main.ECHO_TAIL + 0.05)  # the room goes quiet (+ timer slack)
         await call.on_audio(tone(0.032, amplitude=ECHO_LEVEL))
         assert not call.gate.echo
