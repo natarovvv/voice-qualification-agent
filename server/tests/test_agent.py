@@ -18,6 +18,7 @@ from anyio import ClosedResourceError
 from starlette.websockets import WebSocketDisconnect
 
 import main as main_mod
+import metrics
 import session as session_mod
 import tools
 import tts
@@ -590,6 +591,121 @@ def test_typed_turn_latency_under_budget(client):
         worst = max(samples)
         assert worst < 1200, f"orchestration overhead {worst:.0f} ms exceeds the budget"
         ws.send_text(json.dumps({"type": "end"}))
+
+
+# ------------------------------------------------------------------- metrics
+
+
+@pytest.fixture
+def fresh_metrics():
+    """The counters are process-global, so a test that reads absolute numbers
+    has to start from zero - and leave zero behind for whatever runs next."""
+    metrics.reset()
+    yield
+    metrics.reset()
+
+
+def parse_exposition(body: str) -> dict[str, float]:
+    """Prometheus text into {series: value}. A series keeps its labels."""
+    out = {}
+    for line in body.splitlines():
+        if not line.startswith("#"):
+            series, _, value = line.rpartition(" ")
+            out[series] = float(value)
+    return out
+
+
+def exposition(client, **kw) -> dict[str, float]:
+    response = client.get("/metrics", **kw)
+    assert response.status_code == 200, response.text
+    return parse_exposition(response.text)
+
+
+def test_a_turn_lands_in_the_latency_bucket_it_belongs_in(fresh_metrics):
+    for seconds in (0.15, 0.35, 1.2, 9.0):
+        metrics.observe_first_audio(seconds)
+    got = parse_exposition(metrics.render(active_calls=0))
+
+    assert got['voice_first_audio_seconds_bucket{le="0.2"}'] == 1
+    assert got['voice_first_audio_seconds_bucket{le="0.5"}'] == 2  # cumulative, not per bucket
+    # le means less than or *equal*: a turn landing exactly on the 1200 ms
+    # budget is inside it, and an off-by-one here would report the opposite
+    assert got['voice_first_audio_seconds_bucket{le="1.2"}'] == 3
+    assert got['voice_first_audio_seconds_bucket{le="+Inf"}'] == 4
+    assert got["voice_first_audio_seconds_count"] == 4
+    assert got["voice_first_audio_seconds_sum"] == pytest.approx(10.7)
+
+
+def test_a_quiet_worker_still_exports_its_counters(client, fresh_metrics):
+    """A series that only appears after its first event has nothing to rate at
+    the moment you most want to look: just after a deploy, before any traffic."""
+    got = exposition(client)
+    assert got["voice_calls_total"] == 0
+    assert got["voice_turns_total"] == 0
+    assert got["voice_turn_errors_total"] == 0
+    assert got["voice_first_audio_seconds_count"] == 0
+
+
+def test_a_spoken_turn_moves_every_number_the_scrape_reports(client, fresh_metrics):
+    with client.websocket_connect("/ws?session_id=scrape") as ws:
+        collect(ws, "ready")
+        assert exposition(client)["voice_calls_active"] == 1
+
+        ws.send_bytes(tone(0.6))
+        ws.send_bytes(silence(1.0))
+        reported, _ = collect(ws, "metric")  # the same measurement the UI shows
+        ws.send_text(json.dumps({"type": "end"}))
+
+    got = exposition(client)
+    assert got["voice_calls_total"] == 1
+    assert got["voice_calls_active"] == 0
+    assert got["voice_turns_total"] == 1
+    assert got["voice_turn_errors_total"] == 0
+    assert got['voice_tool_calls_total{ok="true",tool="lookup_kb"}'] == 1
+    # one turn, and the histogram holds the number the caller was sent
+    assert got["voice_first_audio_seconds_count"] == 1
+    assert got["voice_first_audio_seconds_sum"] == pytest.approx(
+        reported["first_audio_ms"] / 1000, abs=0.001
+    )
+
+
+def test_a_turn_that_blows_up_is_counted_as_one(client, fresh_metrics, monkeypatch):
+    async def explode(*_args, **_kw):
+        raise RuntimeError("provider down")
+        yield  # unreachable, and what makes this an async generator
+
+    monkeypatch.setattr(client.app.state.llm, "stream", explode)
+    with client.websocket_connect("/ws?session_id=boom") as ws:
+        collect(ws, "ready")
+        ws.send_text(json.dumps({"type": "text", "text": "hello"}))
+        collect(ws, "error")
+        ws.send_text(json.dumps({"type": "end"}))
+
+    got = exposition(client)
+    assert got["voice_turns_total"] == 1
+    assert got["voice_turn_errors_total"] == 1  # the turn is counted, and so is its failure
+
+
+def test_a_call_turned_away_says_why_and_is_not_counted_as_served(
+    client, fresh_metrics, monkeypatch
+):
+    monkeypatch.setattr(main_mod, "MAX_CALLS", 0)
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect("/ws") as ws:
+            ws.receive()
+
+    got = exposition(client)
+    assert got['voice_calls_rejected_total{reason="full"}'] == 1
+    # a call that never happened must not dilute the latency or turn rates
+    assert got["voice_calls_total"] == 0
+
+
+def test_the_scrape_is_behind_the_token_when_one_is_set(client, monkeypatch):
+    """How busy the box is and how well it is coping is operator business."""
+    monkeypatch.setattr(main_mod, "AUTH_TOKEN", "s3cret")
+    assert client.get("/metrics").status_code == 401
+    allowed = client.get("/metrics", headers={"authorization": "Bearer s3cret"})
+    assert allowed.status_code == 200 and "voice_calls_total" in allowed.text
 
 
 def real_deepgram_key() -> str:
