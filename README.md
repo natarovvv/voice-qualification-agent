@@ -23,11 +23,13 @@ browser mic ─ AudioWorklet ─► PCM16 16k ─ websocket ─► VAD ─► ST
 | [server/main.py](server/main.py) | FastAPI websocket, turn taking, barge-in, metrics |
 | [server/vad.py](server/vad.py) | Silero VAD, adaptive-energy fallback, speech gating |
 | [server/stt.py](server/stt.py) | Deepgram Nova-2 stream, faster-whisper fallback |
-| [server/llm.py](server/llm.py) | Gemini 2.0 Flash / Groq streaming + tool loop |
-| [server/tts.py](server/tts.py) | edge-tts, streaming MP3→PCM, sentence chunking |
+| [server/llm.py](server/llm.py) | Groq / Gemini streaming + tool loop, offline fallback |
+| [server/tts.py](server/tts.py) | Deepgram Aura, edge-tts fallback, sentence chunking |
 | [server/tools.py](server/tools.py) | The three tools + JSON schemas |
 | [server/session.py](server/session.py) | TTL session memory, sanitizing, call records |
+| [server/storage.py](server/storage.py) | Leads and bookings: JSON files or Postgres |
 | [web/](web/) | Next.js 15 UI: meters, transcript, tool log, latency |
+| [web/lib/voice.ts](web/lib/voice.ts) | Mic capture, jitter buffer, barge-in, session resume |
 
 ## Run it
 
@@ -186,6 +188,7 @@ orchestration overhead alone stays under budget with providers mocked.
 
 ```bash
 cd server && pytest
+cd web && npm test
 ```
 
 Every push and pull request runs them on GitHub Actions
@@ -209,7 +212,21 @@ ids that would escape the calls directory. The Redis store is covered against
 been run against a live `redis-server`. Resume is covered end to end: a socket
 that dies writes no record, a reconnect gets the same session and its first
 half back, an abandoned call is written out when the grace expires, and a
-deliberate hangup is not resumable. Postgres is covered against a real
+deliberate hangup is not resumable.
+
+The browser half is 21 Vitest tests over jsdom. They cover what the client
+tells the browser to do rather than what it renders: chunks of the agent's
+voice scheduled back to back behind one 60 ms jitter buffer and never into the
+past, PCM16 decoded without clipping the negative rail, a barge-in dropping
+the queue **and** rewinding the clock so the next sentence is not stuck behind
+audio nobody will hear, the mic frames stopping at a closed socket, a denied
+microphone still leaving a usable call, and the session id being kept across a
+drop and forgotten on a real hangup. The capture worklet is tested through a
+`postMessage` that genuinely detaches the transferred buffer, because that is
+what turns a missing `.slice()` into silence. Every one of these was checked by
+breaking the code it covers: all thirteen mutations fail the suite.
+
+Postgres is covered against a real
 PostgreSQL booted from the `pgserver` wheel, including six independent stores
 racing for one slot; with the constraint dropped that test sells it six times.
 
