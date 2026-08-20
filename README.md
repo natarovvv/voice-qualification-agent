@@ -58,14 +58,17 @@ Copy `.env.example` to `.env` in the repo root:
 |---|---|
 | `GROQ_API_KEY` | falls back to Gemini, then to the offline script |
 | `GEMINI_API_KEY` | — |
-| `DEEPGRAM_API_KEY` | falls back to local faster-whisper, then to no STT at all |
+| `DEEPGRAM_API_KEY` | STT falls back to local faster-whisper, then to none; the voice falls back to edge-tts |
 
 Groq is tried first, not Gemini. Measured on the free tiers: Groq returns its
 first token in ~600 ms, Gemini in 3–5 s and it 503s under load, and the whole
 turn has 1200 ms. `LLM_PROVIDER=gemini` flips the order back.
 
-TTS needs no key, ever. With no STT the call still connects and typed turns
-still work — the `ready` message reports which STT and LLM actually got picked.
+One Deepgram key covers both directions: Nova-2 transcribes and Aura speaks.
+Without it the voice falls back to edge-tts, which is fine on a laptop and not
+fine in front of a caller — see Security. With no STT the call still connects
+and typed turns still work; the `ready` message reports which STT, TTS and LLM
+actually got picked.
 
 `faster-whisper` and `numpy` are only needed for the local-STT path; nothing
 else imports them.
@@ -120,19 +123,25 @@ Budget is 1200 ms end to end. The design choices that buy it:
 
 - The reply is split into sentences and each one is sent to TTS as soon as it
   is complete, so audio starts before the model has finished thinking.
-- MP3 from edge-tts is decoded incrementally, never buffered whole.
+- The Aura socket is opened once per call, not once per sentence. Connecting
+  costs ~800 ms and is most of the latency of a one-shot request; paying it at
+  call setup is what keeps a sentence at 235–484 ms.
+- Aura returns linear16 at 16 kHz, so on that path there is no MP3 decode at
+  all. edge-tts still decodes incrementally, never buffered whole.
 - The browser plays with 60 ms of jitter slack, not a full-clip wait.
 
-Measured on this machine. Orchestration only, with providers mocked:
+Measured on this machine:
 
-| stage | measured |
-|---|---|
-| edge-tts first audio, cold process | ~1350 ms |
-| edge-tts first audio, warm | 360–550 ms |
-| full turn, typed input → first PCM byte | 407–516 ms |
+| stage | deepgram-aura | edge-tts |
+|---|---|---|
+| greeting, first audio | 1172 ms | 437 ms |
+| sentence mid-call, first audio | 235–484 ms | 360–550 ms |
+| full turn, typed input → first PCM byte (mocked providers) | 407–516 ms | 407–516 ms |
 
-The cold number is DNS + TLS to Microsoft. `tts.prewarm()` runs at startup so a
-caller never pays it.
+Aura costs about 700 ms on the greeting and pays it back on every sentence
+after. The greeting is the one sentence that genuinely waits for the socket,
+because nothing can be said before the voice is connected. `tts.prewarm()`
+warms DNS and TLS at startup so the per-call connect is the warm one.
 
 Opening the socket to the first byte of the greeting: **330–450 ms**. The
 greeting is spoken before the Deepgram handshake, not after it — that
@@ -198,11 +207,20 @@ Data and third parties, which are decisions rather than settings:
 - Call records under `server/data/` are plain JSON: transcript, email, company
   size, summary. No encryption at rest. `CALL_RETENTION_DAYS` (default 30)
   deletes them at startup; there is no per-caller erasure endpoint yet.
-- Audio goes to Deepgram, text goes to Groq or Gemini, and TTS goes through
-  `edge-tts` — an undocumented consumer Microsoft endpoint with no commercial
-  agreement behind it. Fine for a demo, not something to build a product on:
-  you need a real TTS contract and DPAs with each provider before a live
-  caller's voice reaches any of them.
+- Audio goes to Deepgram, text goes to Groq or Gemini. With `DEEPGRAM_API_KEY`
+  set, the voice is Deepgram Aura — the same vendor and contract as the
+  transcriber, so one DPA covers both directions. Without the key it falls back
+  to `edge-tts`, an undocumented consumer Microsoft endpoint with no commercial
+  agreement behind it; the server logs a warning when it does. Keep that path
+  for development only, and get DPAs with Deepgram and your LLM provider before
+  a live caller's voice reaches either.
+- **Erasure requests:** `DELETE /data?email=...` with `Authorization: Bearer
+  $AUTH_TOKEN` deletes that caller's leads, bookings and call records and
+  reports what it removed. It is refused outright unless `AUTH_TOKEN` is set,
+  and the agent cannot reach it — an erase tool the model could call would let
+  a caller delete someone else's records by naming their address. A call where
+  the caller never gave an email has no key to match on; the retention window
+  is what clears those.
 
 ## Known corners
 
@@ -212,6 +230,7 @@ Data and third parties, which are decisions rather than settings:
   temp-file-then-rename so a crash cannot truncate one. The lock is
   process-local: with more than one worker, move to Postgres.
 - KB search is term overlap, not embeddings.
+- edge-tts remains the keyless fallback and is development-only; see Security.
 - Silero VAD needs torch (~200 MB). Skip it and the adaptive energy gate takes
   over — fine for a headset, worse in a noisy room.
 - Model names on the free tiers rot. `gemini-2.0-flash` and

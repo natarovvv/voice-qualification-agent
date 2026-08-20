@@ -15,13 +15,14 @@ import logging
 import os
 import secrets
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 import httpx
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 import llm as llm_mod
+import tools
 import tts
 from config import (
     ALLOWED_ORIGINS,
@@ -77,6 +78,29 @@ async def health() -> dict:
     return {"ok": True}
 
 
+@app.delete("/data")
+async def erase(email: str, request: Request) -> dict:
+    """Erase everything held about one caller - the right-to-erasure handle.
+
+    Operator-only, and refused outright unless AUTH_TOKEN is configured: an
+    open delete endpoint is a worse problem than the one it solves. Erasure
+    requests arrive by mail or through support, and a human runs this; the
+    agent cannot reach it, so no amount of talking to it deletes anything.
+    """
+    if not AUTH_TOKEN:
+        raise HTTPException(503, "set AUTH_TOKEN to enable erasure requests")
+    supplied = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+    if not secrets.compare_digest(supplied, AUTH_TOKEN):
+        raise HTTPException(401, "bad token")
+
+    result = await asyncio.to_thread(tools.erase_caller, email)
+    if not result["ok"]:
+        raise HTTPException(400, result["error"])
+    # The address is the thing being erased, so it does not go in the log.
+    log.info("erasure request completed: %s", result["removed"])
+    return result
+
+
 def authorized(ws: WebSocket) -> bool:
     """Gate the websocket by origin and, if configured, a shared secret.
 
@@ -114,6 +138,7 @@ class Call:
     def __init__(self, ws: WebSocket, session, llm) -> None:
         self.ws, self.session, self.llm = ws, session, llm
         self.stt = make_stt()
+        self.tts = tts.make_tts()
         self.gate = SpeechGate()
         self.audio_limit = RateLimiter(BYTES_PER_SEC * RATE_LIMIT_FACTOR)
         # Typed turns skip the microphone and so skip the audio budget: without
@@ -128,11 +153,18 @@ class Call:
 
     # ---------- outbound ----------
 
+    # A caller who hangs up mid-sentence leaves a send in flight, and starlette
+    # reports that as WebSocketDisconnect, RuntimeError or anyio's
+    # ClosedResourceError depending on where it was caught. Naming them is how
+    # one of them gets missed, and a missed one kills the turn that still has
+    # to write the call record. Any failed send means the same thing: gone.
+    # CancelledError is a BaseException, so barge-in still passes through.
+
     async def send(self, **msg) -> None:
         if not self.closed:
             try:
                 await self.ws.send_text(json.dumps(msg))
-            except (WebSocketDisconnect, RuntimeError):
+            except Exception:  # noqa: BLE001
                 self.closed = True
 
     async def send_audio(self, pcm: bytes) -> None:
@@ -141,7 +173,7 @@ class Call:
                 await self.ws.send_bytes(pcm)
                 # the client is still playing this out after the last byte leaves
                 self.play_until = max(self.play_until, time.monotonic()) + pcm_seconds(pcm)
-            except (WebSocketDisconnect, RuntimeError):
+            except Exception:  # noqa: BLE001
                 self.closed = True
 
     # ---------- the reply half of a turn ----------
@@ -159,7 +191,7 @@ class Call:
     async def say(self, text: str, first: bool = False) -> None:
         """Speak one sentence and report time-to-first-audio."""
         await self.send(type="assistant", text=text)
-        async for pcm in tts.speak(text):
+        async for pcm in self.tts.speak(text):
             if first and self.turn_start:
                 await self.send(
                     type="metric",
@@ -205,7 +237,15 @@ class Call:
         if self.speaking and not self.speaking.done():
             self.speaking.cancel()
             self.play_until = 0.0  # the client drops its queue on this message
-            await self.send(type="interrupt")
+            await self.send(type="interrupt")  # the caller stops hearing us here
+            # ...and only then wait for the turn to unwind and the voice to
+            # drop its in-flight audio. Both touch state the next turn needs,
+            # and neither is something the caller is waiting on.
+            # However that turn ended is its own business - respond() already
+            # logged it. Letting it out here would take the call record with it.
+            with suppress(asyncio.CancelledError, Exception):
+                await self.speaking
+            await self.tts.reset()
 
     async def _finish_turn(self, grace: float) -> None:
         """Fire after the grace period; whatever transcript arrived is the turn."""
@@ -261,6 +301,7 @@ class Call:
     async def hangup(self):
         await self.interrupt()
         await self.stt.close()
+        await self.tts.close()
         if not self.session.transcript:
             return
         summary = await llm_mod.summarize(self.llm, self.session.transcript, self.session.facts)
@@ -283,9 +324,20 @@ async def voice_ws(ws: WebSocket) -> None:
     session = STORE.get(ws.query_params.get("session_id"))
     call = Call(ws, session, app.state.llm)
     await call.send(
-        type="ready", session_id=session.id, stt=call.stt.name, llm=call.llm.name, sample_rate=16000
+        type="ready",
+        session_id=session.id,
+        stt=call.stt.name,
+        tts=call.tts.name,
+        llm=call.llm.name,
+        sample_rate=16000,
     )
     reader = asyncio.create_task(call.stt_loop())
+    # The voice has to be connected before anything can be said, so this
+    # handshake is the one the greeting genuinely waits on.
+    try:
+        await call.tts.start()
+    except Exception:  # noqa: BLE001 - a mute agent still beats a refused call
+        log.exception("tts failed to start; the call runs without audio")
     # Greet before connecting the transcriber, not after: that handshake is
     # most of a second and the caller cannot say anything worth hearing until
     # the greeting is out. Audio arriving early is dropped by an unstarted

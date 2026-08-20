@@ -8,10 +8,13 @@ import asyncio
 import json
 import math
 import os
+import pathlib
+import secrets
 import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from anyio import ClosedResourceError
 from starlette.websockets import WebSocketDisconnect
 
 import main as main_mod
@@ -258,12 +261,29 @@ class FakeSTT:
         pass
 
 
-async def fake_speak(text: str, voice: str | None = None):
+class FakeTTS:
     """Deterministic 'audio' - no network, but slow enough that a barge-in
     has a real sentence to cut into (4 x 50 ms per sentence)."""
-    for _ in range(4):
-        await asyncio.sleep(0.05)
-        yield silence(0.05)
+
+    name = "fake"
+
+    def __init__(self):
+        self.resets = 0
+        self.closed = False
+
+    async def start(self):
+        pass
+
+    async def speak(self, text: str):
+        for _ in range(4):
+            await asyncio.sleep(0.05)
+            yield silence(0.05)
+
+    async def reset(self):
+        self.resets += 1
+
+    async def close(self):
+        self.closed = True
 
 
 @pytest.fixture
@@ -272,11 +292,11 @@ def client(monkeypatch):
 
     import main
 
-    stt = FakeSTT()
+    stt, voice = FakeSTT(), FakeTTS()
     monkeypatch.setattr(main, "make_stt", lambda: stt)
-    monkeypatch.setattr(main.tts, "speak", fake_speak)
+    monkeypatch.setattr(main.tts, "make_tts", lambda: voice)
     with TestClient(main.app) as c:
-        c.stt = stt
+        c.stt, c.tts = stt, voice
         yield c
 
 
@@ -431,6 +451,51 @@ def test_typed_turn_latency_under_budget(client):
         ws.send_text(json.dumps({"type": "end"}))
 
 
+def real_deepgram_key() -> str:
+    """conftest scrubs the provider keys; the live tests want the real one."""
+    from dotenv import dotenv_values
+
+    root = pathlib.Path(__file__).resolve().parents[2]
+    return (dotenv_values(root / ".env").get("DEEPGRAM_API_KEY") or "").strip()
+
+
+@pytest.mark.skipif(not os.getenv("RUN_LIVE"), reason="set RUN_LIVE=1 to hit the real Deepgram")
+def test_live_deepgram_voice_speaks_and_clears():
+    """The contracted voice, end to end: real socket, real PCM, and a barge-in
+    that leaves the socket clean enough for the next sentence."""
+    key = real_deepgram_key()
+    if not key:
+        pytest.skip("no DEEPGRAM_API_KEY in .env")
+    voice = tts.DeepgramTTS(api_key=key)
+
+    async def drive():
+        await voice.start()
+        try:
+            audio = bytearray()
+            async for pcm in voice.speak("There are three plans: Starter, Growth and Enterprise."):
+                audio.extend(pcm)
+            assert len(audio) > SAMPLE_RATE, "less than half a second came back"
+            peak = max(abs(int.from_bytes(audio[i : i + 2], "little", signed=True))
+                       for i in range(0, len(audio) - 1, 2))
+            assert peak > 2000, f"the voice is near-silent (peak {peak})"
+
+            # interrupt a long sentence, then check the next one is not its tail
+            long_one = voice.speak("This sentence is deliberately long so that it "
+                                   "can be cut off part of the way through it.")
+            await long_one.__anext__()
+            await long_one.aclose()
+            await voice.reset()
+
+            short = bytearray()
+            async for pcm in voice.speak("Yes."):
+                short.extend(pcm)
+            assert len(short) / (SAMPLE_RATE * 2) < 1.5, "stale audio leaked into the next sentence"
+        finally:
+            await voice.close()
+
+    asyncio.run(drive())
+
+
 @pytest.mark.skipif(not os.getenv("RUN_LIVE"), reason="set RUN_LIVE=1 to hit the real edge-tts")
 def test_live_tts_produces_real_audio(monkeypatch):
     """The one test that talks to the network: real edge-tts, real MP3 decode,
@@ -494,6 +559,138 @@ def test_websocket_rejects_a_bad_token(client, monkeypatch):
     assert caught.value.code == 1008
     with client.websocket_connect("/ws?token=s3cret") as ws:
         collect(ws, "ready")
+
+
+def test_barge_in_resets_the_voice(client):
+    """A cancelled sentence leaves audio in flight upstream; the next sentence
+    must not open with its tail."""
+    with client.websocket_connect("/ws") as ws:
+        collect(ws, "ready")
+        for _ in range(3):
+            ws.send_bytes(tone(0.3))
+        collect(ws, "interrupt")
+        ws.send_text(json.dumps({"type": "end"}))
+    assert client.tts.resets >= 1, "barge-in never told the voice to drop its buffer"
+    assert client.tts.closed, "the voice socket outlived the call"
+
+
+class DeadWS:
+    """A socket whose peer hung up. starlette surfaces that as any of several
+    exception types depending on where the send was caught."""
+
+    def __init__(self, exc):
+        self.exc = exc
+
+    async def send_text(self, text: str):
+        raise self.exc
+
+    async def send_bytes(self, data: bytes):
+        raise self.exc
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [ClosedResourceError(), RuntimeError("after close"), WebSocketDisconnect(1000)],
+    ids=["anyio-closed", "runtime", "disconnect"],
+)
+def test_a_dead_socket_never_escapes_a_send(exc, monkeypatch):
+    """A caller who hangs up mid-sentence fails the send in flight. If that
+    escapes, it takes down the turn that still has to write the call record."""
+    import main
+
+    monkeypatch.setattr(main, "make_stt", lambda: FakeSTT())
+    monkeypatch.setattr(main.tts, "make_tts", lambda: FakeTTS())
+    call = main.Call(DeadWS(exc), session_mod.Session(id="dead"), None)
+
+    async def drive():
+        await call.send(type="assistant", text="hello")
+        await call.send_audio(silence(0.05))
+
+    asyncio.run(drive())
+    assert call.closed, "a failed send must mark the call closed"
+
+
+def test_interrupt_does_not_propagate_a_failed_turn(monkeypatch):
+    """interrupt() waits for the cancelled turn so the voice socket is settled
+    before the next one. That wait re-raises whatever the turn ended on, and
+    hangup() calls interrupt() before writing the call record - so a turn that
+    died while unwinding must not travel out through here."""
+    import main
+
+    monkeypatch.setattr(main, "make_stt", lambda: FakeSTT())
+    monkeypatch.setattr(main.tts, "make_tts", lambda: FakeTTS())
+    call = main.Call(StubWS(), session_mod.Session(id="failed"), None)
+
+    async def drive():
+        async def dies_on_the_way_out():
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                raise ClosedResourceError from None  # the socket went first
+
+        call.speaking = asyncio.create_task(dies_on_the_way_out())
+        await asyncio.sleep(0.01)  # let it reach the sleep
+        await call.interrupt()     # must not raise
+        assert call.speaking.done()
+
+    asyncio.run(drive())
+
+
+# -------------------------------------------------------------------- erasure
+
+
+def seed_caller(email: str) -> str:
+    tools.check_lead_qualification(email, "600")
+    slot = (datetime.now(timezone.utc) + timedelta(days=3)).replace(
+        hour=10, minute=0, second=0, microsecond=0
+    )
+    while slot.weekday() >= 5:
+        slot += timedelta(days=1)
+    tools.book_calendar_slot(email, slot.strftime("%Y-%m-%d %H:%M"))
+    s = session_mod.Session(id=secrets.token_urlsafe(8))
+    s.add_turn("user", "please delete my data afterwards")
+    s.add_tool_call(
+        "check_lead_qualification", {"email": email, "company_size": "600"},
+        tools.check_lead_qualification(email, "600"),
+    )
+    s.save({})
+    return s.id
+
+
+def test_erase_removes_one_caller_and_leaves_the_others(client, monkeypatch):
+    monkeypatch.setattr(main_mod, "AUTH_TOKEN", "s3cret")
+    mine = seed_caller("erase-me@acme.io")
+    theirs = seed_caller("keep-me@acme.io")
+
+    r = client.request("DELETE", "/data", params={"email": "erase-me@acme.io"},
+                       headers={"authorization": "Bearer s3cret"})
+    assert r.status_code == 200, r.text
+    removed = r.json()["removed"]
+    assert removed["leads"] >= 1 and removed["bookings"] == 1 and removed["calls"] == 1
+
+    assert not (session_mod.CALLS_DIR / f"{mine}.json").exists()
+    assert (session_mod.CALLS_DIR / f"{theirs}.json").exists(), "erased the wrong caller"
+    leftover = json.loads((tools.DATA_DIR / "leads.json").read_text(encoding="utf-8"))
+    assert all(row["email"] != "erase-me@acme.io" for row in leftover)
+    assert any(row["email"] == "keep-me@acme.io" for row in leftover)
+
+
+def test_erase_needs_the_token_and_refuses_when_none_is_configured(client, monkeypatch):
+    monkeypatch.setattr(main_mod, "AUTH_TOKEN", "s3cret")
+    assert client.request("DELETE", "/data", params={"email": "x@acme.io"}).status_code == 401
+    assert client.request("DELETE", "/data", params={"email": "x@acme.io"},
+                          headers={"authorization": "Bearer wrong"}).status_code == 401
+    # an open delete endpoint is worse than the problem it solves
+    monkeypatch.setattr(main_mod, "AUTH_TOKEN", "")
+    assert client.request("DELETE", "/data", params={"email": "x@acme.io"},
+                          headers={"authorization": "Bearer s3cret"}).status_code == 503
+
+
+def test_the_model_cannot_reach_the_erase_function():
+    """Prompt injection would otherwise turn a support line into a delete button."""
+    assert "erase_caller" not in tools.REGISTRY
+    assert not any(schema["name"] == "erase_caller" for schema in tools.SCHEMAS)
+    assert tools.call("erase_caller", {"email": "victim@acme.io"})["error"] == "unknown_tool"
 
 
 def test_typed_turns_are_rate_limited(client):

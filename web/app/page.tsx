@@ -39,7 +39,7 @@ export default function Home() {
   const [partial, setPartial] = useState("");
   const [tools, setTools] = useState<ToolLog[]>([]);
   const [latency, setLatency] = useState<number[]>([]);
-  const [meta, setMeta] = useState<{ stt?: string; llm?: string; id?: string }>({});
+  const [meta, setMeta] = useState<{ stt?: string; tts?: string; llm?: string; id?: string }>({});
   const [levels, setLevels] = useState<[number, number]>([0, 0]);
   const [summary, setSummary] = useState<Record<string, unknown> | null>(null);
   const [typed, setTyped] = useState("");
@@ -52,7 +52,7 @@ export default function Home() {
   const onEvent = useCallback((e: ServerEvent) => {
     switch (e.type) {
       case "ready":
-        setMeta({ stt: e.stt, llm: e.llm, id: e.session_id });
+        setMeta({ stt: e.stt, tts: e.tts, llm: e.llm, id: e.session_id });
         break;
       case "partial":
         setPartial(e.text);
@@ -132,6 +132,7 @@ export default function Home() {
           <span className={`pill ${live ? "on" : ""}`}>{state}</span>
           {meta.llm && <span className="pill muted">{meta.llm}</span>}
           {meta.stt && <span className="pill muted">{meta.stt}</span>}
+          {meta.tts && <span className="pill muted">{meta.tts}</span>}
         </div>
       </header>
 
