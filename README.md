@@ -28,7 +28,7 @@ browser mic ─ AudioWorklet ─► PCM16 16k ─ websocket ─► VAD ─► ST
 | [server/tools.py](server/tools.py) | The three tools + JSON schemas |
 | [server/session.py](server/session.py) | TTL session memory, sanitizing, call records |
 | [server/storage.py](server/storage.py) | Leads and bookings: JSON files or Postgres |
-| [web/](web/) | Next.js 15 UI: meters, transcript, tool log, latency |
+| [web/](web/) | Next.js 16 UI: meters, transcript, tool log, latency |
 | [web/lib/voice.ts](web/lib/voice.ts) | Mic capture, jitter buffer, barge-in, session resume |
 
 ## Run it

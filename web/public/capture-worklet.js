@@ -28,3 +28,7 @@ class CaptureProcessor extends AudioWorkletProcessor {
 }
 
 registerProcessor("capture", CaptureProcessor);
+
+// addModule() loads this as a module script, so saying so costs nothing and
+// lets the worklet test import it for the side effect above.
+export {};
