@@ -10,6 +10,7 @@ import math
 import os
 import pathlib
 import secrets
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -1122,6 +1123,160 @@ def test_erase_removes_one_caller_and_leaves_the_others(client, monkeypatch):
     leftover = json.loads((tools.DATA_DIR / "leads.json").read_text(encoding="utf-8"))
     assert all(row["email"] != "erase-me@acme.io" for row in leftover)
     assert any(row["email"] == "keep-me@acme.io" for row in leftover)
+
+# --------------------------------------------------- encryption at rest
+
+
+def cipher_for(*keys: str):
+    from cryptography.fernet import Fernet, MultiFernet
+
+    return MultiFernet([Fernet(k) for k in keys])
+
+
+def new_key() -> str:
+    from cryptography.fernet import Fernet
+
+    return Fernet.generate_key().decode()
+
+
+@pytest.fixture
+def sealed(monkeypatch):
+    """Records encrypted for the length of one test, under a key of its own."""
+    monkeypatch.setattr(session_mod, "CIPHER", cipher_for(new_key()))
+
+
+def test_a_sealed_record_never_reaches_the_disk_in_the_clear(sealed):
+    s = session_mod.Session(id="sealed-one")
+    s.add_turn("user", "my card ends 4242 and my email is cto@acme-corp.io")
+    s.add_turn("assistant", "Thanks, noted.")
+    s.facts["email"] = "cto@acme-corp.io"
+    written = s.save({"intent": "pricing"})
+
+    path = session_mod.CALLS_DIR / "sealed-one.json"
+    raw = path.read_text(encoding="utf-8")
+    assert "cto@acme-corp.io" not in raw
+    assert "4242" not in raw
+    assert "Thanks, noted." not in raw
+
+    blob = json.loads(raw)
+    assert blob["enc"] == "fernet"
+    # the id is the filename already, and retention has to find a file without
+    # opening it - so it is the one thing left legible
+    assert blob["session_id"] == "sealed-one"
+    assert session_mod.read_record(path) == written
+
+
+def test_a_record_written_before_the_key_still_opens(sealed):
+    """Turning encryption on is not a migration: both kinds share the directory."""
+    path = session_mod.CALLS_DIR / "plain-one.json"
+    session_mod.write_json(path, {"session_id": "plain-one", "lead": {"email": "old@acme-corp.io"}})
+
+    assert session_mod.read_record(path)["lead"]["email"] == "old@acme-corp.io"
+
+
+def test_a_rotated_key_opens_yesterday_and_seals_today_with_the_new_one(monkeypatch):
+    old, new = new_key(), new_key()
+
+    monkeypatch.setattr(session_mod, "CIPHER", cipher_for(old))
+    yesterday = session_mod.CALLS_DIR / "rot-old.json"
+    session_mod.write_json(yesterday, session_mod.seal({"session_id": "rot-old", "lead": {}}))
+
+    monkeypatch.setattr(session_mod, "CIPHER", cipher_for(new, old))  # new first: it seals
+    assert session_mod.read_record(yesterday)["session_id"] == "rot-old"
+    today = session_mod.CALLS_DIR / "rot-new.json"
+    session_mod.write_json(today, session_mod.seal({"session_id": "rot-new", "lead": {}}))
+
+    monkeypatch.setattr(session_mod, "CIPHER", cipher_for(new))  # the old key is retired
+    assert session_mod.read_record(today)["session_id"] == "rot-new"
+    with pytest.raises(session_mod.Unreadable):
+        session_mod.read_record(yesterday)
+
+def test_the_first_key_in_the_setting_is_the_one_that_seals(monkeypatch):
+    """Rotation is an ordering contract: put the new key first and the retired
+    one second, and today's records use the new key while yesterday's still
+    open. Reverse it and the retired key keeps sealing, silently."""
+    from cryptography.fernet import InvalidToken
+
+    fresh, retired = new_key(), new_key()
+    monkeypatch.setattr(session_mod, "CALL_ENCRYPTION_KEYS", [fresh, retired])
+    monkeypatch.setattr(session_mod, "CIPHER", session_mod._make_cipher())
+
+    token = session_mod.seal({"session_id": "ordering", "lead": {}})["data"].encode()
+
+    assert json.loads(cipher_for(fresh).decrypt(token))["session_id"] == "ordering"
+    with pytest.raises(InvalidToken):
+        cipher_for(retired).decrypt(token)
+
+
+def test_a_tampered_record_is_refused_rather_than_returned(sealed):
+    """Fernet authenticates the ciphertext, so this is encryption and not
+    obfuscation: an edited record does not come back quietly rewritten."""
+    path = session_mod.CALLS_DIR / "tampered.json"
+    session_mod.write_json(path, session_mod.seal({"session_id": "tampered", "lead": {"tier": "cold"}}))
+
+    blob = json.loads(path.read_text(encoding="utf-8"))
+    blob["data"] = blob["data"][:-8] + "AAAAAAAA"
+    session_mod.write_json(path, blob)
+
+    with pytest.raises(session_mod.Unreadable):
+        session_mod.read_record(path)
+
+
+def test_erasure_reaches_inside_a_sealed_record(client, monkeypatch, sealed):
+    monkeypatch.setattr(main_mod, "AUTH_TOKEN", "s3cret")
+    mine = seed_caller("sealed-erase@acme.io")
+    theirs = seed_caller("sealed-keep@acme.io")
+    assert "sealed-erase@acme.io" not in (session_mod.CALLS_DIR / f"{mine}.json").read_text(
+        encoding="utf-8"
+    ), "the record under test is not actually sealed"
+
+    r = client.request("DELETE", "/data", params={"email": "sealed-erase@acme.io"},
+                       headers={"authorization": "Bearer s3cret"})
+
+    assert r.json()["removed"]["calls"] == 1
+    assert not (session_mod.CALLS_DIR / f"{mine}.json").exists()
+    assert (session_mod.CALLS_DIR / f"{theirs}.json").exists(), "erased the wrong caller"
+
+
+def test_erasure_reports_the_records_it_could_not_open(client, monkeypatch):
+    """A record nobody can open is a record nobody can prove was erased. The
+    operator answering the request has to see that the count is short."""
+    monkeypatch.setattr(session_mod, "CIPHER", cipher_for(new_key()))
+    stranger = session_mod.CALLS_DIR / "someone-elses-key.json"
+    session_mod.write_json(stranger, session_mod.seal({"session_id": "someone-elses-key", "lead": {}}))
+
+    monkeypatch.setattr(main_mod, "AUTH_TOKEN", "s3cret")
+    monkeypatch.setattr(session_mod, "CIPHER", cipher_for(new_key()))  # a key that cannot open it
+    r = client.request("DELETE", "/data", params={"email": "nobody@acme.io"},
+                       headers={"authorization": "Bearer s3cret"})
+
+    assert r.json()["removed"]["unreadable"] >= 1
+    assert stranger.exists(), "deleted a record it could not identify"
+    stranger.unlink()  # it would count against every later erasure test
+
+
+def test_a_key_with_no_library_refuses_to_start(monkeypatch):
+    """Writing plaintext you believe is encrypted is worse than not starting."""
+    monkeypatch.setattr(session_mod, "CALL_ENCRYPTION_KEYS", [new_key()])
+    monkeypatch.setitem(sys.modules, "cryptography.fernet", None)
+
+    with pytest.raises(RuntimeError, match="cryptography is not installed"):
+        session_mod._make_cipher()
+
+
+def test_a_key_that_is_not_a_key_refuses_to_start(monkeypatch):
+    monkeypatch.setattr(session_mod, "CALL_ENCRYPTION_KEYS", ["hunter2"])
+    with pytest.raises(ValueError):
+        session_mod._make_cipher()
+
+
+def test_no_key_means_the_records_are_written_the_way_they_always_were(monkeypatch):
+    monkeypatch.setattr(session_mod, "CALL_ENCRYPTION_KEYS", [])
+    assert session_mod._make_cipher() is None
+
+    monkeypatch.setattr(session_mod, "CIPHER", None)
+    record = {"session_id": "plain-two", "lead": {"email": "x@acme.io"}}
+    assert session_mod.seal(record) is record
 
 
 def test_erase_needs_the_token_and_refuses_when_none_is_configured(client, monkeypatch):

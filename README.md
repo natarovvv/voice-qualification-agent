@@ -26,7 +26,7 @@ browser mic ─ AudioWorklet ─► PCM16 16k ─ websocket ─► VAD ─► ST
 | [server/llm.py](server/llm.py) | Groq / Gemini streaming + tool loop, runtime failover |
 | [server/tts.py](server/tts.py) | Deepgram Aura, edge-tts fallback, sentence chunking |
 | [server/tools.py](server/tools.py) | The three tools + JSON schemas |
-| [server/session.py](server/session.py) | TTL session memory, sanitizing, call records |
+| [server/session.py](server/session.py) | TTL session memory, sanitizing, sealed call records |
 | [server/metrics.py](server/metrics.py) | Prometheus counters and the latency histogram |
 | [server/storage.py](server/storage.py) | Leads and bookings: JSON files or Postgres |
 | [web/](web/) | Next.js 16 UI: meters, transcript, tool log, latency |
@@ -70,6 +70,7 @@ Copy `.env.example` to `.env` in the repo root:
 | both LLM keys | with only one, a provider outage is a failed turn rather than a slower one |
 | `GEMINI_API_KEY` | — |
 | `DEEPGRAM_API_KEY` | STT falls back to local faster-whisper, then to none; the voice falls back to edge-tts |
+| `CALL_ENCRYPTION_KEY` | call records are written to disk in the clear, as before |
 | `REDIS_URL` | sessions live in a process-local dict instead of a shared store |
 | `DATABASE_URL` | leads and bookings stay JSON files, which one process may write |
 
@@ -263,7 +264,8 @@ for the web app. CI installs `requirements.lock` rather than
 `requirements.txt`: the lock is the core path, and the extras would pull torch
 and CUDA wheels for two fallbacks the tests stub out anyway. No keys are
 configured there and none are needed — the live tests skip themselves and
-`pgserver` brings its own PostgreSQL.
+`pgserver` brings its own PostgreSQL. `cryptography` is in the lock so the
+sealed path is covered there too, not just where a key happens to be set.
 
 Run the one network test with `RUN_LIVE=1 pytest -k live` — it hits the real
 edge-tts and asserts the decoded PCM is real audio, not silence.
@@ -303,7 +305,11 @@ outside. Failover is eleven tests and ten more mutations, all caught — that a
 provider which already spoke keeps its turn, that one which already ran a tool
 keeps it too, that a benched provider sits out the next turn and comes back
 when the cooldown is up, and that a caller barging in is not mistaken for a
-provider failing.
+provider failing. Encryption is ten tests and nine more mutations: that the
+transcript and the email are not in the file, that a tampered record is refused
+rather than quietly returned, that a rotated key opens yesterday and seals
+today, and that erasure reaches inside a sealed record — and counts the ones it
+cannot open instead of passing over them.
 
 Postgres is covered against a real
 PostgreSQL booted from the `pgserver` wheel, including six independent stores
@@ -330,11 +336,37 @@ off unless `DEV=1`. Before it listens anywhere else:
 
 Data and third parties, which are decisions rather than settings:
 
-- Call records under `server/data/` are plain JSON: transcript, email, company
-  size, summary. Leads and bookings move to Postgres with `DATABASE_URL`, but
-  the transcripts stay on disk. No encryption at rest either way.
-  `CALL_RETENTION_DAYS` (default 30) deletes them at startup, and the erasure
-  endpoint below handles a named caller.
+- **Encryption at rest:** set `CALL_ENCRYPTION_KEY` and every call record
+  written to `server/data/calls/` is sealed with Fernet — the whole
+  transcript, the caller's email, the summary. Generate a key with:
+
+  ```bash
+  python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+  ```
+
+  The setting takes a comma-separated list so a key can be rotated without a
+  migration: the **first** key seals, any of them opens. Records written before
+  the key existed are still plain JSON and still read, so turning it on is not
+  a migration either — both kinds share the directory.
+
+  The session id stays legible, because it is the filename already and
+  retention has to find a file without opening it. It is a random token, not
+  anything about the caller.
+
+  Setting the key with `cryptography` missing, or setting a key that is not a
+  key, stops the process from starting. Writing plaintext you believe is
+  encrypted is worse than not starting.
+
+  **What this does not cover:** leads and bookings. On the JSON backend
+  `server/data/leads.json` still holds the address in the clear, and on
+  Postgres the rows are plaintext columns — the email is indexed and the
+  booking overlap is an `EXCLUDE USING gist` constraint, and neither works on
+  ciphertext. Encrypt the volume, or use the database's own at-rest
+  encryption. The conversation is the bulk of what a call reveals and that is
+  what the key seals; the lead row is a name and a company size.
+
+  `CALL_RETENTION_DAYS` (default 30) deletes records at startup whether sealed
+  or not, and the erasure endpoint below handles a named caller.
 - Audio goes to Deepgram, text goes to Groq or Gemini. With `DEEPGRAM_API_KEY`
   set, the voice is Deepgram Aura — the same vendor and contract as the
   transcriber, so one DPA covers both directions. Without the key it falls back
@@ -351,7 +383,11 @@ Data and third parties, which are decisions rather than settings:
   and the agent cannot reach it — an erase tool the model could call would let
   a caller delete someone else's records by naming their address. A call where
   the caller never gave an email has no key to match on; the retention window
-  is what clears those.
+  is what clears those. A record it cannot open — sealed with a key this
+  deployment does not have — is counted in `removed["unreadable"]` rather than
+  passed over quietly: a record nobody can read is a record nobody can prove
+  was erased, and the operator answering the request needs to see the count is
+  short.
 
 ## Known corners
 
@@ -384,6 +420,10 @@ Data and third parties, which are decisions rather than settings:
   where a 503 usually means the next request fails too, but it does mean one
   unlucky request moves the call to the slower model for half a minute. Count
   failures before benching if you move to a paid tier where a blip is a blip.
+- The session copy in Redis is not sealed. It holds the live transcript for
+  `SESSION_TTL` (30 minutes) so a dropped call can resume, and Redis is
+  normally memory-only; the 30-day copy on disk is the one worth a key. Turn
+  off Redis persistence, or encrypt its volume, if that is not good enough.
 - The knowledge base stays a file either way. It is content that ships with the
   repo, not caller data.
 - The per-email booking cap is checked inside the transaction but under read

@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from config import DATA_DIR
-from session import CALLS_DIR
+from session import CALLS_DIR, Unreadable, read_record
 from storage import STORAGE
 
 log = logging.getLogger(__name__)
@@ -168,6 +168,10 @@ def erase_caller(email: str) -> dict:
     A call where the caller never gave an email has no key to match on and so
     survives; the retention window in session.purge_old_calls is what clears
     those.
+    Records this process cannot open - sealed with a key it does not have, or
+    truncated - are counted in ``removed["unreadable"]`` instead of being
+    passed over quietly. A short count the operator can see beats a complete
+    one they cannot trust.
     """
     email = (email or "").strip().lower()
     if not EMAIL_RE.match(email):
@@ -175,10 +179,16 @@ def erase_caller(email: str) -> dict:
 
     removed = STORAGE.erase(email)
     removed["calls"] = 0
+    removed["unreadable"] = 0
     for f in CALLS_DIR.glob("*.json"):
         try:
-            rec = json.loads(f.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            rec = read_record(f)
+        except Unreadable as exc:
+            # Reported rather than skipped in silence: a record nobody can open
+            # is a record nobody can prove was erased, and the operator
+            # answering the request needs to know the count is short.
+            log.warning("erasure could not read %s", exc)
+            removed["unreadable"] += 1
             continue
         lead = rec.get("lead") or {}
         addresses = {str(lead.get("email", "")).lower(),
