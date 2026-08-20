@@ -11,8 +11,9 @@ DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "")                      # "groq" | "gemini"; blank = fastest first
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")  # 2.0-flash is retired
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")        # llama-3.3-70b is gone
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "tiny.en")
 TTS_VOICE = os.getenv("TTS_VOICE", "en-US-AriaNeural")
 

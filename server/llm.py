@@ -14,7 +14,7 @@ from typing import AsyncIterator, Awaitable, Callable
 import httpx
 
 import tools
-from config import GEMINI_API_KEY, GEMINI_MODEL, GROQ_API_KEY, GROQ_MODEL
+from config import GEMINI_API_KEY, GEMINI_MODEL, GROQ_API_KEY, GROQ_MODEL, LLM_PROVIDER
 
 log = logging.getLogger(__name__)
 
@@ -39,7 +39,9 @@ class GeminiLLM:
     base = "https://generativelanguage.googleapis.com/v1beta/models"
 
     def __init__(self, client: httpx.AsyncClient, api_key: str, model: str = GEMINI_MODEL) -> None:
-        self.client, self.api_key, self.model = client, api_key, model
+        self.client, self.model = client, model
+        # header, not ?key=: httpx logs the whole URL at INFO
+        self.headers = {"x-goog-api-key": api_key}
 
     def _contents(self, history: list[dict]) -> list[dict]:
         return [
@@ -54,12 +56,17 @@ class GeminiLLM:
                 "systemInstruction": {"parts": [{"text": system}]},
                 "contents": contents,
                 "tools": [{"functionDeclarations": tools.SCHEMAS}],
-                "generationConfig": {"temperature": 0.6, "maxOutputTokens": 200},
+                "generationConfig": {
+                    "temperature": 0.6,
+                    "maxOutputTokens": 200,
+                    # a caller will not wait for the model to think
+                    "thinkingConfig": {"thinkingBudget": 0},
+                },
             }
             pending: list[dict] = []
             model_parts: list[dict] = []
-            url = f"{self.base}/{self.model}:streamGenerateContent?alt=sse&key={self.api_key}"
-            async with self.client.stream("POST", url, json=body, timeout=TIMEOUT) as resp:
+            url = f"{self.base}/{self.model}:streamGenerateContent?alt=sse"
+            async with self.client.stream("POST", url, json=body, headers=self.headers, timeout=TIMEOUT) as resp:
                 resp.raise_for_status()
                 async for line in resp.aiter_lines():
                     if not line.startswith("data:"):
@@ -88,13 +95,13 @@ class GeminiLLM:
             )
 
     async def json_call(self, system: str, prompt: str) -> dict:
-        url = f"{self.base}/{self.model}:generateContent?key={self.api_key}"
+        url = f"{self.base}/{self.model}:generateContent"
         body = {
             "systemInstruction": {"parts": [{"text": system}]},
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
         }
-        r = await self.client.post(url, json=body, timeout=TIMEOUT)
+        r = await self.client.post(url, json=body, headers=self.headers, timeout=TIMEOUT)
         r.raise_for_status()
         text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
         return json.loads(text)
@@ -216,10 +223,14 @@ class OfflineLLM:
 
 
 def make_llm(client: httpx.AsyncClient):
-    if GEMINI_API_KEY:
-        return GeminiLLM(client, GEMINI_API_KEY)
-    if GROQ_API_KEY:
-        return GroqLLM(client, GROQ_API_KEY)
+    # Groq first: measured ~600 ms to first token against Gemini's 3-5 s on the
+    # free tier, and the whole turn has 1200 ms. LLM_PROVIDER=gemini flips it.
+    order = [("groq", GROQ_API_KEY, GroqLLM), ("gemini", GEMINI_API_KEY, GeminiLLM)]
+    if LLM_PROVIDER:
+        order.sort(key=lambda p: p[0] != LLM_PROVIDER)
+    for _, key, cls in order:
+        if key:
+            return cls(client, key)
     log.warning("No LLM key set - running the offline script")
     return OfflineLLM()
 
