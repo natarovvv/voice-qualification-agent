@@ -842,3 +842,153 @@ def test_typed_turns_are_rate_limited(client):
             ws.send_text(json.dumps({"type": "text", "text": "hello"}))
         err, _ = collect(ws, "error", limit=400)
         assert "slow down" in err["message"]
+
+
+# ------------------------------------------------------------------- postgres
+
+
+@pytest.fixture(scope="session")
+def pg_uri():
+    """A real PostgreSQL, booted from the pgserver wheel. No server to install.
+
+    Not fakeanything: the whole point of this backend is a constraint that only
+    a real database enforces, so a stand-in would test the wrong thing.
+    """
+    pgserver = pytest.importorskip("pgserver")
+    import tempfile
+
+    # The data directory must not sit under a path with spaces in it - some of
+    # pgserver's helpers shell out without quoting, and this repo's own folder
+    # name has both a space and an ampersand in it.
+    workdir = pathlib.Path(tempfile.mkdtemp(prefix="voice-agent-pg-"))
+    server = pgserver.get_server(workdir)
+    try:
+        yield server.get_uri()
+    finally:
+        server.cleanup()
+
+
+@pytest.fixture
+def pg_store(pg_uri):
+    import storage as storage_mod
+
+    store = storage_mod.PostgresStore(url=pg_uri)
+    store.ensure_schema()
+    with store.pool.connection() as conn:
+        conn.execute("TRUNCATE leads, bookings")
+    yield store
+    store.pool.close()
+
+
+def slot(days_ahead: int = 3, hour: int = 10) -> datetime:
+    when = (datetime.now(timezone.utc) + timedelta(days=days_ahead)).replace(
+        hour=hour, minute=0, second=0, microsecond=0
+    )
+    while when.weekday() >= 5:
+        when += timedelta(days=1)
+    return when
+
+
+def booking(email: str, start: datetime) -> dict:
+    return {
+        "email": email,
+        "start": start.isoformat(),
+        "end": (start + timedelta(minutes=30)).isoformat(),
+        "booked_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def test_postgres_stores_a_lead_and_erases_it(pg_store):
+    lead = {
+        "email": "cto@acme.io", "domain": "acme.io", "company_size": 600,
+        "score": 80, "tier": "hot", "reasons": ["business email domain", "500+ employees"],
+        "qualified": True, "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+    pg_store.add_lead(lead)
+    with pg_store.pool.connection() as conn:
+        row = conn.execute(
+            "SELECT email, company_size, tier, reasons FROM leads"
+        ).fetchone()
+    assert row[0] == "cto@acme.io" and row[1] == 600 and row[2] == "hot"
+    assert row[3] == ["business email domain", "500+ employees"], "jsonb did not round-trip"
+
+    assert pg_store.erase("cto@acme.io") == {"leads": 1, "bookings": 0}
+    with pg_store.pool.connection() as conn:
+        assert conn.execute("SELECT count(*) FROM leads").fetchone()[0] == 0
+
+
+def test_postgres_refuses_an_overlapping_slot(pg_store):
+    start = slot()
+    assert pg_store.book(booking("a@acme.io", start), 30, 3) is None
+    # a different caller, fifteen minutes in: overlapping, so refused
+    assert pg_store.book(booking("b@acme.io", start + timedelta(minutes=15)), 30, 3) == "slot_taken"
+    # and the slot straight after is free
+    assert pg_store.book(booking("b@acme.io", start + timedelta(minutes=30)), 30, 3) is None
+
+
+def test_postgres_caps_bookings_per_email(pg_store):
+    start = slot()
+    for i in range(3):
+        assert pg_store.book(booking("greedy@acme.io", start + timedelta(minutes=30 * i)), 30, 3) is None
+    assert pg_store.book(
+        booking("greedy@acme.io", start + timedelta(minutes=90)), 30, 3
+    ) == "too_many_bookings"
+
+
+def test_two_workers_cannot_sell_the_same_slot(pg_store, pg_uri):
+    """The reason this table is not a JSON file.
+
+    Each racer gets its own store with its own pool, which is what a second
+    worker actually is - no shared application lock anywhere between them. The
+    JSON backend would hand every one of them the same free slot, because its
+    threading.Lock is process-local. Here the constraint decides, and the
+    database is the only thing all the workers have in common.
+    """
+    import threading
+
+    import storage as storage_mod
+
+    start = slot(days_ahead=4)
+    workers = [storage_mod.PostgresStore(url=pg_uri) for _ in range(6)]
+    for w in workers:
+        w.ensure_schema()
+
+    ready = threading.Barrier(len(workers))
+    results: list[str | None] = []
+    guard = threading.Lock()
+
+    def race(n: int, store):
+        ready.wait()  # everyone swings at the same moment
+        outcome = store.book(booking(f"w{n}@acme.io", start), 30, 3)
+        with guard:
+            results.append(outcome)
+
+    threads = [threading.Thread(target=race, args=(n, w)) for n, w in enumerate(workers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    for w in workers:
+        w.pool.close()
+
+    assert results.count(None) == 1, f"the slot was sold {results.count(None)} times: {results}"
+    assert results.count("slot_taken") == len(workers) - 1
+    with pg_store.pool.connection() as conn:
+        assert conn.execute("SELECT count(*) FROM bookings").fetchone()[0] == 1
+
+
+def test_the_tools_run_against_postgres(pg_store, monkeypatch):
+    """The tools themselves, not just the store underneath them."""
+    monkeypatch.setattr(tools, "STORAGE", pg_store)
+
+    qualified = tools.check_lead_qualification("cfo@bigco.com", "900")
+    assert qualified["ok"] and qualified["tier"] == "hot"
+
+    when = slot(days_ahead=5)
+    booked = tools.book_calendar_slot("cfo@bigco.com", when.strftime("%Y-%m-%d %H:%M"))
+    assert booked["ok"], booked
+    clash = tools.book_calendar_slot("other@bigco.com", when.strftime("%Y-%m-%d %H:%M"))
+    assert clash["error"] == "slot_taken"
+
+    erased = tools.erase_caller("cfo@bigco.com")
+    assert erased["removed"]["leads"] == 1 and erased["removed"]["bookings"] == 1

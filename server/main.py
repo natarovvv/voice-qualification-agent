@@ -22,6 +22,7 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.middleware.cors import CORSMiddleware
 
 import llm as llm_mod
+import storage
 import tools
 import tts
 from config import (
@@ -55,7 +56,15 @@ async def lifespan(app: FastAPI):
     app.state.llm = llm_mod.make_llm(app.state.http)
     app.state.calls = 0
     asyncio.create_task(tts.prewarm())  # pay the TLS handshake before a caller does
-    log.info("llm provider: %s | sessions: %s", app.state.llm.name, STORE.name)
+    log.info(
+        "llm provider: %s | sessions: %s | storage: %s",
+        app.state.llm.name, STORE.name, storage.STORAGE.name,
+    )
+    if hasattr(storage.STORAGE, "ensure_schema"):
+        try:  # a database that is down must not stop the process from starting
+            await asyncio.to_thread(storage.STORAGE.ensure_schema)
+        except Exception:  # noqa: BLE001
+            log.exception("could not reach the database; tool calls will report it")
     log.info("retention: purged %s expired call records", purge_old_calls())
     if not AUTH_TOKEN and HOST not in ("127.0.0.1", "localhost", "::1"):
         log.warning(

@@ -60,6 +60,7 @@ Copy `.env.example` to `.env` in the repo root:
 | `GEMINI_API_KEY` | — |
 | `DEEPGRAM_API_KEY` | STT falls back to local faster-whisper, then to none; the voice falls back to edge-tts |
 | `REDIS_URL` | sessions live in a process-local dict instead of a shared store |
+| `DATABASE_URL` | leads and bookings stay JSON files, which one process may write |
 
 Groq is tried first, not Gemini. Measured on the free tiers: Groq returns its
 first token in ~600 ms, Gemini in 3–5 s and it 503s under load, and the whole
@@ -184,7 +185,9 @@ barge-in, the latency benchmark against mocked providers, and the access
 checks: a foreign origin, a bad token, a rate-limited typed turn, and session
 ids that would escape the calls directory. The Redis store is covered against
 `fakeredis` - real command semantics, real constructor, but nothing here has
-been run against a live `redis-server`.
+been run against a live `redis-server`. Postgres is covered against a real
+PostgreSQL booted from the `pgserver` wheel, including six independent stores
+racing for one slot; with the constraint dropped that test sells it six times.
 
 ## Security
 
@@ -208,7 +211,8 @@ off unless `DEV=1`. Before it listens anywhere else:
 Data and third parties, which are decisions rather than settings:
 
 - Call records under `server/data/` are plain JSON: transcript, email, company
-  size, summary. No encryption at rest. `CALL_RETENTION_DAYS` (default 30)
+  size, summary. Leads and bookings move to Postgres with `DATABASE_URL`, but
+  the transcripts stay on disk. No encryption at rest either way. `CALL_RETENTION_DAYS` (default 30)
   deletes them at startup; there is no per-caller erasure endpoint yet.
 - Audio goes to Deepgram, text goes to Groq or Gemini. With `DEEPGRAM_API_KEY`
   set, the voice is Deepgram Aura — the same vendor and contract as the
@@ -235,11 +239,20 @@ Data and third parties, which are decisions rather than settings:
   worker safe. Sessions the worker is serving stay in a local dict too, so a
   Redis outage degrades to the single-process behaviour instead of dropping
   the caller's history mid-sentence.
-- **The actual blocker for a second worker is storage, not sessions.** Leads,
-  bookings and the KB are JSON files behind a `threading.Lock`, written
-  temp-file-then-rename so a crash cannot truncate one. That lock is
-  process-local and does nothing across processes: two workers will lose each
-  other's writes. Move to Postgres before running more than one.
+- Leads and bookings live in Postgres when `DATABASE_URL` is set and in JSON
+  files when it is not. The files are written temp-file-then-rename so a crash
+  cannot truncate one, but their `threading.Lock` is process-local and does
+  nothing across processes: on files, **two workers will sell the same slot
+  twice.** On Postgres they cannot, because the overlap is an `EXCLUDE USING
+  gist` constraint rather than an application check — the database refuses the
+  second booking whoever asks. With `DATABASE_URL` and `REDIS_URL` both set,
+  more than one worker is safe.
+- The knowledge base stays a file either way. It is content that ships with the
+  repo, not caller data.
+- The per-email booking cap is checked inside the transaction but under read
+  committed, so two simultaneous bookings can land at cap + 1. It is a spam
+  guard rather than money; the overlap constraint is the invariant that
+  actually holds.
 - KB search is term overlap, not embeddings.
 - edge-tts remains the keyless fallback and is development-only; see Security.
 - Silero VAD needs torch (~200 MB). Skip it and the adaptive energy gate takes
