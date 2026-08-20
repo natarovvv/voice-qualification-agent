@@ -6,6 +6,7 @@ script (so the demo still runs with zero API keys).
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import logging
@@ -26,7 +27,9 @@ ToolSink = Callable[[str, dict, dict], Awaitable[None]]
 async def _run_tools(calls: list[dict], on_tool: ToolSink | None) -> list[dict]:
     out = []
     for c in calls:
-        result = tools.call(c["name"], c.get("args") or {})
+        # to_thread: the storage backend may be a real database, and a
+        # blocking round trip on the event loop would stall every other call.
+        result = await asyncio.to_thread(tools.call, c["name"], c.get("args") or {})
         # Arguments carry the caller's email. Logs get shipped, tailed and kept
         # far longer than a call record, so they get the shape, not the values.
         log.info("tool %s(%s) -> %s", c["name"], sorted((c.get("args") or {})), result.get("ok"))

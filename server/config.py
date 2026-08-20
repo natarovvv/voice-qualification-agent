@@ -51,6 +51,10 @@ SESSION_TTL = int(os.getenv("SESSION_TTL", "1800"))          # seconds
 # Shared session store. Unset = a process-local dict, which is what one worker
 # wants anyway. See the note in session.py about what this does and does not fix.
 REDIS_URL = os.getenv("REDIS_URL", "")
+# Leads and bookings. Unset keeps the JSON files, which need no setup and are
+# single-process only. Postgres is what makes a second worker safe: the "is
+# this slot free" check becomes an EXCLUDE constraint instead of a lock.
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 MAX_TURN_CHARS = 2000                                        # sanitize user text
 MAX_HISTORY_TURNS = 24
 RATE_LIMIT_FACTOR = 4                                        # x realtime audio allowed

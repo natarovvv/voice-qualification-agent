@@ -1,22 +1,23 @@
 """The three callable tools plus their JSON-schema declarations.
 
-Storage is a JSON file per collection - a $0 stand-in for Postgres.
-ponytail: file-per-collection behind a process lock; move to Postgres when
-more than one worker writes.
+Business rules live here; where the rows go is storage.py's problem. The
+knowledge base is the exception - it is content that ships with the repo, so it
+stays a file read straight from disk.
 """
 from __future__ import annotations
 
 import json
+import logging
 import re
-import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from config import DATA_DIR
-from session import CALLS_DIR, write_json
+from session import CALLS_DIR
+from storage import STORAGE
 
-_LOCK = threading.Lock()
-MAX_RECORDS = 5000        # per collection; the file is read whole on every call
+log = logging.getLogger(__name__)
+
 MAX_BOOKING_DAYS = 60     # nobody books a support call a year out
 MAX_BOOKINGS_PER_EMAIL = 3
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s.]+\.[^@\s]{2,}$")
@@ -25,23 +26,11 @@ BUSINESS_START, BUSINESS_END = 9, 17  # UTC hours the calendar accepts
 SLOT_MINUTES = 30
 
 
-def _path(name: str):
-    return DATA_DIR / f"{name}.json"
-
-
-def _load(name: str, default: Any) -> Any:
+def _load_kb() -> list:
     try:
-        return json.loads(_path(name).read_text(encoding="utf-8"))
+        return json.loads((DATA_DIR / "kb.json").read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
-        return default
-
-
-def _save(name: str, value: Any) -> None:
-    # Keep the tail only: an unbounded list is both a disk-filling target and a
-    # linear cost on every single tool call, since the file is loaded whole.
-    if isinstance(value, list) and len(value) > MAX_RECORDS:
-        value = value[-MAX_RECORDS:]
-    write_json(_path(name), value)
+        return []
 
 
 def parse_company_size(company_size: Any) -> int | None:
@@ -96,10 +85,7 @@ def check_lead_qualification(email: str, company_size: Any) -> dict:
         "qualified": tier in ("hot", "warm"),
         "checked_at": datetime.now(timezone.utc).isoformat(),
     }
-    with _LOCK:
-        leads = _load("leads", [])
-        leads.append(record)
-        _save("leads", leads)
+    STORAGE.add_lead(record)
     return {"ok": True, **record}
 
 
@@ -146,32 +132,28 @@ def book_calendar_slot(email: str, datetime_iso: str) -> dict:
         }
 
     end = start + timedelta(minutes=SLOT_MINUTES)
-    with _LOCK:
-        bookings = _load("bookings", [])
-        # A caller who can reach the agent can reach the calendar. Without a cap
-        # one of them books out every slot and nobody else gets a meeting.
-        if sum(1 for b in bookings if b.get("email") == email) >= MAX_BOOKINGS_PER_EMAIL:
-            return {
-                "ok": False,
-                "error": "too_many_bookings",
-                "message": "You already have the maximum number of calls booked.",
-            }
-        for b in bookings:
-            b_start = _parse_dt(b["start"])
-            if b_start and b_start < end and start < b_start + timedelta(minutes=SLOT_MINUTES):
-                return {
-                    "ok": False,
-                    "error": "slot_taken",
-                    "message": f"{start:%A %H:%M} UTC is taken. Suggest {end:%H:%M} UTC.",
-                }
-        record = {
-            "email": email,
-            "start": start.isoformat(),
-            "end": end.isoformat(),
-            "booked_at": now.isoformat(),
+    record = {
+        "email": email,
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "booked_at": now.isoformat(),
+    }
+    # A caller who can reach the agent can reach the calendar, so the cap is
+    # here; whether the slot is free is the store's call, because on Postgres
+    # that is a constraint and no amount of workers can talk it round.
+    refused = STORAGE.book(record, SLOT_MINUTES, MAX_BOOKINGS_PER_EMAIL)
+    if refused == "too_many_bookings":
+        return {
+            "ok": False,
+            "error": "too_many_bookings",
+            "message": "You already have the maximum number of calls booked.",
         }
-        bookings.append(record)
-        _save("bookings", bookings)
+    if refused == "slot_taken":
+        return {
+            "ok": False,
+            "error": "slot_taken",
+            "message": f"{start:%A %H:%M} UTC is taken. Suggest {end:%H:%M} UTC.",
+        }
     return {"ok": True, "confirmation": f"{start:%A %d %B at %H:%M} UTC", **record}
 
 
@@ -191,27 +173,19 @@ def erase_caller(email: str) -> dict:
     if not EMAIL_RE.match(email):
         return {"ok": False, "error": "invalid_email"}
 
-    removed = {}
-    with _LOCK:
-        for name in ("leads", "bookings"):
-            rows = _load(name, [])
-            kept = [r for r in rows if str(r.get("email", "")).lower() != email]
-            removed[name] = len(rows) - len(kept)
-            if removed[name]:
-                _save(name, kept)
-
-        removed["calls"] = 0
-        for f in CALLS_DIR.glob("*.json"):
-            try:
-                rec = json.loads(f.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            lead = rec.get("lead") or {}
-            addresses = {str(lead.get("email", "")).lower(),
-                         str((lead.get("booking") or {}).get("email", "")).lower()}
-            if email in addresses:
-                f.unlink(missing_ok=True)
-                removed["calls"] += 1
+    removed = STORAGE.erase(email)
+    removed["calls"] = 0
+    for f in CALLS_DIR.glob("*.json"):
+        try:
+            rec = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        lead = rec.get("lead") or {}
+        addresses = {str(lead.get("email", "")).lower(),
+                     str((lead.get("booking") or {}).get("email", "")).lower()}
+        if email in addresses:
+            f.unlink(missing_ok=True)
+            removed["calls"] += 1
     return {"ok": True, "email": email, "removed": removed}
 
 
@@ -245,7 +219,7 @@ def lookup_kb(query: str) -> dict:
         return {"ok": True, "found": False, "message": "Nothing to search on. Ask them to say more."}
 
     scored = []
-    for art in _load("kb", []):
+    for art in _load_kb():
         labels = _terms(f"{art['title']} {' '.join(art.get('tags', []))}", stop=False)
         words = labels | _terms(art["body"], stop=False)
         relevance = len(terms & words) / len(terms)
@@ -322,3 +296,7 @@ def call(name: str, args: dict) -> dict:
         return fn(**{k: v for k, v in (args or {}).items() if k in allowed})
     except TypeError as exc:
         return {"ok": False, "error": "bad_arguments", "message": str(exc)}
+    except Exception as exc:  # noqa: BLE001 - a database that is down is a tool
+        # failure the agent can talk about, not a turn that dies on the caller
+        log.exception("tool %s failed", name)
+        return {"ok": False, "error": "tool_failed", "message": str(exc)}

@@ -13,6 +13,9 @@ av>=12.0,<19.0      # bundled ffmpeg: decodes edge-tts mp3 -> PCM, no system ins
 # --- optional: shared session store; unset REDIS_URL keeps the local dict ---
 redis>=5.0,<9.0
 
+# --- optional: leads and bookings in Postgres; unset DATABASE_URL keeps files ---
+psycopg[binary,pool]>=3.1,<4.0
+
 # --- optional: better VAD (torch is ~200 MB; energy gate runs without it) ---
 silero-vad>=5.1,<6.0
 
@@ -22,5 +25,6 @@ numpy>=1.26,<3.0
 
 # --- tests ---
 fakeredis>=2.23,<3.0
+pgserver>=0.1.4,<1.0     # a real postgres for the tests, no server to install
 pytest>=8.0,<10.0
 pytest-asyncio>=0.24,<2.0
