@@ -48,6 +48,11 @@ PORT = int(os.getenv("PORT", "8000"))
 
 # --- limits ---
 SESSION_TTL = int(os.getenv("SESSION_TTL", "1800"))          # seconds
+# How long a call whose socket died stays resumable before its record is
+# written. A dropped connection is not a hangup - a tunnel dies, a phone
+# changes network, a tab reloads - and ending the call there throws away
+# everything said so far. 0 disables it: every disconnect ends the call.
+RESUME_GRACE = float(os.getenv("RESUME_GRACE", "60"))        # seconds
 # Shared session store. Unset = a process-local dict, which is what one worker
 # wants anyway. See the note in session.py about what this does and does not fix.
 REDIS_URL = os.getenv("REDIS_URL", "")

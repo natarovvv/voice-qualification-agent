@@ -1,5 +1,7 @@
 # Voice AI Support & Qualification Agent
 
+[![ci](https://github.com/natarovvv/voice-qualification-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/natarovvv/voice-qualification-agent/actions/workflows/ci.yml)
+
 Real-time voice-to-voice agent for inbound support and lead qualification.
 Streaming audio both ways over one websocket, barge-in, three callable tools,
 session memory, and a structured call record at hangup.
@@ -50,6 +52,11 @@ still work, which is how you test on a box with no microphone. **End call**
 waits for the call record, so it takes a few seconds — that is an LLM round
 trip writing the summary.
 
+If the connection drops instead of ending — wifi blinks, the tab reloads —
+press **Start call** again. The tab remembers the session id, and the agent
+picks the same conversation back up rather than greeting you from scratch.
+That window is `RESUME_GRACE`, 60 seconds by default.
+
 ### Keys (all optional)
 
 Copy `.env.example` to `.env` in the repo root:
@@ -94,6 +101,12 @@ disables the duck, which is what you want on a headset), `ECHO_START_MS`,
 
 Client sends raw PCM16 16 kHz mono frames (512 samples), plus
 `{"type":"text","text":…}` for a typed turn and `{"type":"end"}` to hang up.
+
+`{"type":"end"}` is the difference between hanging up and being cut off. A
+socket that closes without it leaves the call resumable for `RESUME_GRACE`
+seconds (default 60): reconnect with that `session_id` and the conversation
+continues, history and all, greeted as a call that got cut off rather than a
+new one. If nobody comes back, the record is written when the grace expires.
 
 Server sends PCM16 16 kHz mono frames back, plus JSON:
 
@@ -175,6 +188,14 @@ orchestration overhead alone stays under budget with providers mocked.
 cd server && pytest
 ```
 
+Every push and pull request runs them on GitHub Actions
+([.github/workflows/ci.yml](.github/workflows/ci.yml)), along with `next build`
+for the web app. CI installs `requirements.lock` rather than
+`requirements.txt`: the lock is the core path, and the extras would pull torch
+and CUDA wheels for two fallbacks the tests stub out anyway. No keys are
+configured there and none are needed — the live tests skip themselves and
+`pgserver` brings its own PostgreSQL.
+
 Run the one network test with `RUN_LIVE=1 pytest -k live` — it hits the real
 edge-tts and asserts the decoded PCM is real audio, not silence.
 
@@ -185,7 +206,10 @@ barge-in, the latency benchmark against mocked providers, and the access
 checks: a foreign origin, a bad token, a rate-limited typed turn, and session
 ids that would escape the calls directory. The Redis store is covered against
 `fakeredis` - real command semantics, real constructor, but nothing here has
-been run against a live `redis-server`. Postgres is covered against a real
+been run against a live `redis-server`. Resume is covered end to end: a socket
+that dies writes no record, a reconnect gets the same session and its first
+half back, an abandoned call is written out when the grace expires, and a
+deliberate hangup is not resumable. Postgres is covered against a real
 PostgreSQL booted from the `pgserver` wheel, including six independent stores
 racing for one slot; with the constraint dropped that test sells it six times.
 
@@ -212,8 +236,9 @@ Data and third parties, which are decisions rather than settings:
 
 - Call records under `server/data/` are plain JSON: transcript, email, company
   size, summary. Leads and bookings move to Postgres with `DATABASE_URL`, but
-  the transcripts stay on disk. No encryption at rest either way. `CALL_RETENTION_DAYS` (default 30)
-  deletes them at startup; there is no per-caller erasure endpoint yet.
+  the transcripts stay on disk. No encryption at rest either way.
+  `CALL_RETENTION_DAYS` (default 30) deletes them at startup, and the erasure
+  endpoint below handles a named caller.
 - Audio goes to Deepgram, text goes to Groq or Gemini. With `DEEPGRAM_API_KEY`
   set, the voice is Deepgram Aura — the same vendor and contract as the
   transcriber, so one DPA covers both directions. Without the key it falls back
@@ -232,13 +257,16 @@ Data and third parties, which are decisions rather than settings:
 ## Known corners
 
 - Session memory is a process-local dict unless `REDIS_URL` is set, in which
-  case sessions are shared and expire on Redis's own TTL. Be clear about what
-  that buys: a call lives on one worker for its whole life and `hangup()` ends
-  the session on any disconnect, so nothing is contended between workers -
-  Redis makes an interrupted call recoverable, it does not make a second
-  worker safe. Sessions the worker is serving stay in a local dict too, so a
-  Redis outage degrades to the single-process behaviour instead of dropping
-  the caller's history mid-sentence.
+  case sessions are shared and expire on Redis's own TTL. Either way it is a
+  call that dropped, not a second worker, that the store is for: a call lives
+  on one worker for its whole life, and the drop timer that eventually writes
+  its record is that worker's own. Sessions the worker is serving stay in a
+  local dict too, so a Redis outage degrades to the single-process behaviour
+  instead of dropping the caller's history mid-sentence.
+- Reconnecting is manual. The browser keeps the session id in `sessionStorage`
+  and hands it back on the next Start, so a dropped call continues where it
+  stopped — but nothing redials on its own. Auto-reconnect is worth adding
+  when a caller is expected to be on a phone rather than at a desk.
 - Leads and bookings live in Postgres when `DATABASE_URL` is set and in JSON
   files when it is not. The files are written temp-file-then-rename so a crash
   cannot truncate one, but their `threading.Lock` is process-local and does

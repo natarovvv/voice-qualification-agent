@@ -844,6 +844,93 @@ def test_typed_turns_are_rate_limited(client):
         assert "slow down" in err["message"]
 
 
+# --------------------------------------------------------------------- resume
+
+
+@pytest.fixture(autouse=True)
+def no_stale_drop_timers():
+    """A drop timer from one test must not write a record during the next."""
+    yield
+    main_mod._PENDING.clear()
+
+
+def start_a_call(client, sid: str | None = None) -> tuple[str, object]:
+    """Open a call, get one caller turn into the transcript, hand back the id."""
+    ws = client.websocket_connect(f"/ws?session_id={sid}" if sid else "/ws").__enter__()
+    ready, _ = collect(ws, "ready")
+    ws.send_text(json.dumps({"type": "text", "text": "what does it cost"}))
+    collect(ws, "final")  # the turn is in the transcript now
+    return ready["session_id"], ws
+
+
+def test_a_dropped_socket_does_not_end_the_call(client):
+    """A connection that dies is not a hangup: a tunnel drops, a phone changes
+    network, a tab reloads. Ending the call there loses everything said."""
+    sid, ws = start_a_call(client)
+    ws.__exit__(None, None, None)  # no {"type":"end"} - the socket just went
+
+    assert not (session_mod.CALLS_DIR / f"{sid}.json").exists(), "wrote the record anyway"
+    assert sid in main_mod._PENDING, "nothing is holding the call open"
+
+
+def test_a_reconnect_continues_the_same_call(client):
+    sid, ws = start_a_call(client)
+    ws.__exit__(None, None, None)
+
+    with client.websocket_connect(f"/ws?session_id={sid}") as again:
+        ready, _ = collect(again, "ready")
+        assert ready["session_id"] == sid, "the reconnect started a new call"
+        hello, _ = collect(again, "assistant")
+        assert hello["text"] == main_mod.RESUME_GREETING, "greeted as if nothing happened"
+        assert sid not in main_mod._PENDING, "the drop timer is still armed"
+        again.send_text(json.dumps({"type": "end"}))
+        summary, _ = collect(again, "summary")
+
+    spoken = [t["text"] for t in summary["record"]["transcript"]]
+    assert any("what does it cost" in t for t in spoken), "the first half was lost"
+    assert (session_mod.CALLS_DIR / f"{sid}.json").exists()
+
+
+def test_an_abandoned_call_is_written_out_when_the_grace_runs_out(client, monkeypatch):
+    monkeypatch.setattr(main_mod, "RESUME_GRACE", 0.1)
+    sid, ws = start_a_call(client)
+    ws.__exit__(None, None, None)
+
+    path = session_mod.CALLS_DIR / f"{sid}.json"
+    assert not path.exists(), "written before the grace period was up"
+    deadline = time.monotonic() + 5
+    while not path.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert path.exists(), "an abandoned call never got its record"
+
+
+def test_a_deliberate_hangup_is_not_resumable(client):
+    """Someone who hung up gets a new call, not the old one back."""
+    with client.websocket_connect("/ws") as ws:
+        ready, _ = collect(ws, "ready")
+        ws.send_text(json.dumps({"type": "text", "text": "what does it cost"}))
+        collect(ws, "final")
+        ws.send_text(json.dumps({"type": "end"}))
+        collect(ws, "summary")
+    sid = ready["session_id"]
+    assert sid not in main_mod._PENDING
+
+    with client.websocket_connect(f"/ws?session_id={sid}") as again:
+        ready2, _ = collect(again, "ready")
+        assert ready2["session_id"] != sid, "an ended call came back"
+        hello, _ = collect(again, "assistant")
+        assert hello["text"] == main_mod.GREETING
+
+
+def test_resume_can_be_turned_off(client, monkeypatch):
+    """RESUME_GRACE=0 is the old behaviour: every disconnect ends the call."""
+    monkeypatch.setattr(main_mod, "RESUME_GRACE", 0)
+    sid, ws = start_a_call(client)
+    ws.__exit__(None, None, None)
+    assert (session_mod.CALLS_DIR / f"{sid}.json").exists()
+    assert sid not in main_mod._PENDING
+
+
 # ------------------------------------------------------------------- postgres
 
 

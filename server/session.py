@@ -4,12 +4,17 @@ PRD allows "Redis / in-memory dict with TTL", and both are here: set REDIS_URL
 for the shared one, leave it unset for a process-local dict. Same async
 interface either way, so the call path does not know which it got.
 
-Note what Redis does and does not buy. A call lives on one worker for its whole
-life, and hangup() ends the session on any disconnect, so nothing is contended
-between workers today - Redis makes an interrupted call recoverable rather than
-making a second worker safe. The thing that actually blocks a second worker is
-in tools.py: leads and bookings are JSON files behind a threading.Lock, which
-is process-local and does not stop two workers from clobbering each other.
+A session outlives its websocket. A dropped socket is not a hangup, so the call
+stays here for RESUME_GRACE and a reconnect carrying its id picks up the same
+conversation; only a caller who actually hangs up (or a grace period nobody
+came back for) writes the record and ends the session. That is what the store
+is for, and with REDIS_URL the reconnect survives the worker restarting too.
+
+What Redis does not buy is a second worker. A call still lives on one worker
+for its whole life, and the drop timer is that worker's own. The thing that
+actually blocks a second worker is storage.py's JSON backend: leads and
+bookings behind a threading.Lock, which is process-local. DATABASE_URL is the
+setting that fixes that one.
 """
 from __future__ import annotations
 

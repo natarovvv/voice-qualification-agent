@@ -36,6 +36,7 @@ from config import (
     MAX_TURN_CHARS,
     PORT,
     RATE_LIMIT_FACTOR,
+    RESUME_GRACE,
     SYSTEM_PROMPT,
     TEXT_WINDOW,
 )
@@ -47,6 +48,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("voice")
 
 GREETING = "Hi, you have reached support. I am Aria. What can I help you with today?"
+# A resumed call has already been greeted, and greeting it again is the tell
+# that the agent has forgotten the conversation it is about to continue.
+RESUME_GREETING = "Sorry, we got cut off there. I still have us - go ahead."
 ENDPOINT_GRACE = 0.35  # wait this long after silence for a straggling transcript
 
 
@@ -310,17 +314,52 @@ class Call:
                 elif not self.gate.active:  # silence already detected: go now
                     self.schedule_turn()
 
-    async def hangup(self):
-        await self.interrupt()
-        await self.stt.close()
-        await self.tts.close()
-        if not self.session.transcript:
-            return
+    async def finalize(self) -> dict | None:
+        """End the call for good: summarize it, write the record, let it go."""
+        if self.session.ended or not self.session.transcript:
+            return None
         summary = await llm_mod.summarize(self.llm, self.session.transcript, self.session.facts)
         record = self.session.save(summary)
         await STORE.drop(self.session.id)  # the record is on disk now
         log.info("call %s saved: %s turns", self.session.id, len(record["transcript"]))
         return record
+
+    async def hangup(self, clean: bool = True) -> dict | None:
+        """Shut the voice pipes, and end the call only if the caller meant it.
+
+        A socket that simply died is not a hangup. Treating it as one throws
+        away everything said so far and starts the caller's next connection
+        from the greeting, which is the whole reason the session store is
+        shared in the first place. So hold the session open for RESUME_GRACE
+        and write the record only if nobody comes back.
+        """
+        await self.interrupt()
+        await self.stt.close()
+        await self.tts.close()
+        if clean or RESUME_GRACE <= 0 or not self.session.transcript:
+            return await self.finalize()
+        await STORE.put(self.session)  # so the reconnect finds the turns so far
+        _PENDING[self.session.id] = asyncio.create_task(_finalize_later(self))
+        log.info("call %s dropped; resumable for %ss", self.session.id, RESUME_GRACE)
+        return None
+
+
+# Calls whose socket died, waiting to see whether the caller comes back.
+# ponytail: per-worker, so with several workers a reconnect landing on another
+# one leaves this timer to write the record from a copy that stopped growing.
+# Move the timer into Redis - a key whose TTL is the grace - if that day comes.
+_PENDING: dict[str, asyncio.Task] = {}
+
+
+async def _finalize_later(call: Call) -> None:
+    """Write an abandoned call's record once the grace period runs out.
+
+    Cancelled by the reconnect, in which case the call is not over and this
+    never gets past the sleep.
+    """
+    await asyncio.sleep(RESUME_GRACE)
+    _PENDING.pop(call.session.id, None)
+    await call.finalize()
 
 
 @app.websocket("/ws")
@@ -334,7 +373,14 @@ async def voice_ws(ws: WebSocket) -> None:
         return
     app.state.calls += 1
     await ws.accept()
-    session = await STORE.get(ws.query_params.get("session_id"))
+    requested = ws.query_params.get("session_id")
+    # Call off the drop timer before touching the store, while nothing can be
+    # scheduled in between: the caller is back, so this call is not over after
+    # all. If the timer already fired, the pop finds nothing and STORE.get
+    # hands back a fresh session, which is the right answer too.
+    if requested and (pending := _PENDING.pop(requested, None)) is not None:
+        pending.cancel()
+    session = await STORE.get(requested)
     call = Call(ws, session, app.state.llm)
     await call.send(
         type="ready",
@@ -355,13 +401,15 @@ async def voice_ws(ws: WebSocket) -> None:
     # most of a second and the caller cannot say anything worth hearing until
     # the greeting is out. Audio arriving early is dropped by an unstarted
     # stream, which costs nothing.
-    call.speaking = asyncio.create_task(call.say(GREETING))
-    call.session.add_turn("assistant", GREETING)
+    hello = RESUME_GREETING if session.transcript else GREETING
+    call.speaking = asyncio.create_task(call.say(hello))
+    call.session.add_turn("assistant", hello)
     try:
         await call.stt.start()
     except Exception:  # noqa: BLE001 - a dead transcriber must not refuse the call
         log.exception("stt failed to start; typed turns still work")
 
+    clean = False  # did the caller hang up, or did the socket just die?
     try:
         while True:
             msg = await ws.receive()
@@ -378,11 +426,13 @@ async def voice_ws(ws: WebSocket) -> None:
                 if kind == "text":  # typed turn: same pipeline, no microphone
                     if not call.text_limit.allow():
                         await call.send(type="error", message="too many turns; slow down")
+                        clean = True  # we ended this one; it is not coming back
                         break
                     await call.interrupt()
                     text = str(payload.get("text") or "")[:MAX_TURN_CHARS]
                     call.speaking = asyncio.create_task(call.respond(text))
                 elif kind == "end":
+                    clean = True
                     break
     except WebSocketDisconnect:
         pass
@@ -391,7 +441,7 @@ async def voice_ws(ws: WebSocket) -> None:
     finally:
         app.state.calls -= 1
         reader.cancel()
-        record = await call.hangup()
+        record = await call.hangup(clean)
         if record:
             await call.send(type="summary", record=record)
         try:

@@ -4,6 +4,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ServerEvent, VoiceClient } from "@/lib/voice";
 
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL ?? "ws://localhost:8000";
+// Survives a reload, dies with the tab, and is per-tab - which is what a call
+// is. The server holds a dropped call open for a minute, so handing this back
+// continues the conversation instead of starting a new one.
+const SESSION_KEY = "aria-session";
 
 type Line = { who: "caller" | "agent"; text: string };
 type ToolLog = { name: string; args: Record<string, unknown>; ok: boolean; detail: string };
@@ -44,15 +48,26 @@ export default function Home() {
   const [summary, setSummary] = useState<Record<string, unknown> | null>(null);
   const [typed, setTyped] = useState("");
   const logRef = useRef<HTMLDivElement>(null);
+  const wanted = useRef<string | null>(null);  // the session id this connect asked for
 
   useEffect(() => {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight, behavior: "smooth" });
   }, [lines, partial]);
 
+  const clearLog = useCallback(() => {
+    setLines([]);
+    setTools([]);
+    setLatency([]);
+  }, []);
+
   const onEvent = useCallback((e: ServerEvent) => {
     switch (e.type) {
       case "ready":
         setMeta({ stt: e.stt, tts: e.tts, llm: e.llm, id: e.session_id });
+        // A different id than we asked for means the old call was already
+        // closed out, so what is on screen belongs to nothing.
+        if (wanted.current && wanted.current !== e.session_id) clearLog();
+        sessionStorage.setItem(SESSION_KEY, e.session_id);
         break;
       case "partial":
         setPartial(e.text);
@@ -91,12 +106,14 @@ export default function Home() {
         setLines((l) => [...l, { who: "agent", text: `[error] ${e.message}` }]);
         break;
     }
-  }, []);
+  }, [clearLog]);
 
   async function start() {
-    setLines([]);
-    setTools([]);
-    setLatency([]);
+    // An id left over from a dropped connection resumes that call; the log on
+    // screen is its first half, so it stays.
+    const resuming = sessionStorage.getItem(SESSION_KEY);
+    wanted.current = resuming;
+    if (!resuming) clearLog();
     setSummary(null);
     const client = new VoiceClient(WS_URL, {
       onEvent,
@@ -105,7 +122,7 @@ export default function Home() {
     });
     clientRef.current = client;
     try {
-      await client.start();
+      await client.start(resuming ?? undefined);
     } catch (err) {
       setState("idle");
       setLines([{ who: "agent", text: `[mic error] ${(err as Error).message}` }]);
@@ -113,6 +130,10 @@ export default function Home() {
   }
 
   async function stop() {
+    // Hanging up on purpose is the one case that is not resumable, so forget
+    // the id before the socket closes - the next call starts clean.
+    sessionStorage.removeItem(SESSION_KEY);
+    wanted.current = null;
     await clientRef.current?.stop();
     clientRef.current = null;
   }
