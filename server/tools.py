@@ -13,8 +13,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from config import DATA_DIR
+from session import write_json
 
 _LOCK = threading.Lock()
+MAX_RECORDS = 5000        # per collection; the file is read whole on every call
+MAX_BOOKING_DAYS = 60     # nobody books a support call a year out
+MAX_BOOKINGS_PER_EMAIL = 3
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s.]+\.[^@\s]{2,}$")
 FREE_DOMAINS = {"gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "icloud.com", "proton.me"}
 BUSINESS_START, BUSINESS_END = 9, 17  # UTC hours the calendar accepts
@@ -33,7 +37,11 @@ def _load(name: str, default: Any) -> Any:
 
 
 def _save(name: str, value: Any) -> None:
-    _path(name).write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
+    # Keep the tail only: an unbounded list is both a disk-filling target and a
+    # linear cost on every single tool call, since the file is loaded whole.
+    if isinstance(value, list) and len(value) > MAX_RECORDS:
+        value = value[-MAX_RECORDS:]
+    write_json(_path(name), value)
 
 
 def parse_company_size(company_size: Any) -> int | None:
@@ -124,6 +132,12 @@ def book_calendar_slot(email: str, datetime_iso: str) -> dict:
     now = datetime.now(timezone.utc)
     if start < now:
         return {"ok": False, "error": "in_the_past", "message": "That time has passed. Offer a later one."}
+    if start > now + timedelta(days=MAX_BOOKING_DAYS):
+        return {
+            "ok": False,
+            "error": "too_far_ahead",
+            "message": f"Bookings open {MAX_BOOKING_DAYS} days out. Offer something sooner.",
+        }
     if start.weekday() >= 5 or not (BUSINESS_START <= start.hour < BUSINESS_END):
         return {
             "ok": False,
@@ -134,6 +148,14 @@ def book_calendar_slot(email: str, datetime_iso: str) -> dict:
     end = start + timedelta(minutes=SLOT_MINUTES)
     with _LOCK:
         bookings = _load("bookings", [])
+        # A caller who can reach the agent can reach the calendar. Without a cap
+        # one of them books out every slot and nobody else gets a meeting.
+        if sum(1 for b in bookings if b.get("email") == email) >= MAX_BOOKINGS_PER_EMAIL:
+            return {
+                "ok": False,
+                "error": "too_many_bookings",
+                "message": "You already have the maximum number of calls booked.",
+            }
         for b in bookings:
             b_start = _parse_dt(b["start"])
             if b_start and b_start < end and start < b_start + timedelta(minutes=SLOT_MINUTES):

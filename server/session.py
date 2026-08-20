@@ -7,18 +7,54 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 import time
-import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from config import DATA_DIR, MAX_HISTORY_TURNS, MAX_TURN_CHARS, SESSION_TTL
+from config import (
+    CALL_RETENTION_DAYS,
+    DATA_DIR,
+    MAX_HISTORY_TURNS,
+    MAX_TURN_CHARS,
+    SESSION_TTL,
+)
 
 CALLS_DIR = DATA_DIR / "calls"
 CALLS_DIR.mkdir(parents=True, exist_ok=True)
 
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# A session id becomes a filename, so it may never carry a separator, a dot or
+# a drive letter. Checked once, at construction, so every path built from an
+# id downstream is safe by construction rather than by remembering to check.
+_SAFE_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def purge_old_calls(days: int = CALL_RETENTION_DAYS) -> int:
+    """Drop call records past the retention window. Transcripts are personal
+    data; keeping them forever is a liability, not a feature."""
+    if days <= 0:
+        return 0
+    cutoff = time.time() - days * 86400
+    gone = 0
+    for f in CALLS_DIR.glob("*.json"):
+        if f.stat().st_mtime < cutoff:
+            f.unlink(missing_ok=True)
+            gone += 1
+    return gone
+
+
+def write_json(path, value) -> None:
+    """Write to a temp file in the same directory, then rename over the target.
+
+    A half-written JSON file reads back as a parse error, and every loader here
+    treats a parse error as "empty" - so a crash mid-write would silently
+    discard the whole collection instead of losing the last record.
+    """
+    tmp = path.with_name(f"{path.name}.{secrets.token_hex(4)}.tmp")
+    tmp.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
 
 
 def sanitize(text: str) -> str:
@@ -46,6 +82,10 @@ class Session:
     tool_calls: list[dict] = field(default_factory=list)
     facts: dict[str, Any] = field(default_factory=dict)  # email, company_size, tier, booking
     ended: bool = False
+
+    def __post_init__(self) -> None:
+        if not _SAFE_ID.fullmatch(self.id):
+            raise ValueError(f"unsafe session id: {self.id!r}")
 
     def touch(self) -> None:
         self.touched_at = time.time()
@@ -103,9 +143,7 @@ class Session:
     def save(self, summary: dict | None = None) -> dict:
         """Structured output at call end - one JSON file per call."""
         rec = self.record(summary)
-        (CALLS_DIR / f"{self.id}.json").write_text(
-            json.dumps(rec, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
+        write_json(CALLS_DIR / f"{self.id}.json", rec)
         self.ended = True
         return rec
 
@@ -116,12 +154,17 @@ class SessionStore:
         self._items: dict[str, Session] = {}
 
     def get(self, session_id: str | None) -> Session:
+        """Resume a live session, or mint a new one.
+
+        The caller never chooses an id. An id it can choose is an id it can
+        guess, and guessing one lends it someone else's transcript, lead data
+        and end-of-call record.
+        """
         self.sweep()
-        sid = session_id or uuid.uuid4().hex[:12]
-        s = self._items.get(sid)
+        s = self._items.get(session_id) if session_id else None
         if s is None or s.ended:
-            s = Session(id=sid)
-            self._items[sid] = s
+            s = Session(id=secrets.token_urlsafe(18))
+            self._items[s.id] = s
         s.touch()
         return s
 

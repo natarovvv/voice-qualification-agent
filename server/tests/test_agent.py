@@ -12,7 +12,9 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from starlette.websockets import WebSocketDisconnect
 
+import main as main_mod
 import session as session_mod
 import tools
 import tts
@@ -107,11 +109,28 @@ def test_history_is_trimmed_but_transcript_is_not():
 
 def test_session_store_expires_by_ttl():
     store = session_mod.SessionStore(ttl=0.05)
-    first = store.get("abc")
-    assert store.get("abc") is first
+    first = store.get(None)
+    assert store.get(first.id) is first
     time.sleep(0.1)
     assert store.sweep() == 1
-    assert store.get("abc") is not first
+    assert store.get(first.id) is not first
+
+
+def test_session_id_is_minted_by_the_server_not_the_caller():
+    """An id the caller picks is an id it can guess - someone else's call."""
+    store = session_mod.SessionStore()
+    squatter = store.get("guessable")
+    assert squatter.id != "guessable"
+    assert len(squatter.id) >= 16
+    # and the id it did pick is not resumable by guessing it either
+    assert store.get("guessable") is not squatter
+
+
+@pytest.mark.parametrize("bad", ["../../../etc/passwd", "..\..\win.ini", "a/b", "x.json", ""])
+def test_session_id_that_would_escape_the_calls_directory_is_refused(bad):
+    """The id becomes a filename, so a separator in it is an arbitrary write."""
+    with pytest.raises(ValueError):
+        session_mod.Session(id=bad)
 
 
 def test_call_record_is_saved_with_lead_and_transcript():
@@ -441,13 +460,47 @@ def test_live_tts_produces_real_audio(monkeypatch):
 
 
 def test_call_record_written_on_hangup(client):
-    with client.websocket_connect("/ws?session_id=record-me") as ws:
-        collect(ws, "ready")
+    with client.websocket_connect("/ws") as ws:
+        ready, _ = collect(ws, "ready")
         ws.send_text(json.dumps({"type": "text", "text": "what does it cost"}))
         collect(ws, "final")  # guarantees the caller turn is in the transcript
         ws.send_text(json.dumps({"type": "end"}))
         summary, _ = collect(ws, "summary")
     rec = summary["record"]
-    assert rec["session_id"] == "record-me"
+    assert rec["session_id"] == ready["session_id"]
     assert any(t["speaker"] == "caller" for t in rec["transcript"])
-    assert (session_mod.CALLS_DIR / "record-me.json").exists()
+    assert (session_mod.CALLS_DIR / f"{ready['session_id']}.json").exists()
+
+
+# ------------------------------------------------------------------ websocket
+
+
+def test_websocket_rejects_a_foreign_origin(client):
+    """A websocket has no same-origin policy: without this check any page on
+    the internet can open a call on your bill."""
+    with pytest.raises(WebSocketDisconnect) as caught:
+        with client.websocket_connect("/ws", headers={"origin": "https://evil.example"}):
+            pass
+    assert caught.value.code == 1008
+
+
+def test_websocket_rejects_a_bad_token(client, monkeypatch):
+    import main
+
+    monkeypatch.setattr(main, "AUTH_TOKEN", "s3cret")
+    with pytest.raises(WebSocketDisconnect) as caught:
+        with client.websocket_connect("/ws?token=wrong"):
+            pass
+    assert caught.value.code == 1008
+    with client.websocket_connect("/ws?token=s3cret") as ws:
+        collect(ws, "ready")
+
+
+def test_typed_turns_are_rate_limited(client):
+    """Typed turns skip the microphone and so skip the audio budget."""
+    with client.websocket_connect("/ws") as ws:
+        collect(ws, "ready")
+        for _ in range(main_mod.MAX_TEXT_TURNS + 2):
+            ws.send_text(json.dumps({"type": "text", "text": "hello"}))
+        err, _ = collect(ws, "error", limit=400)
+        assert "slow down" in err["message"]

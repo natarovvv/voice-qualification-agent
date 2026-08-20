@@ -27,7 +27,9 @@ async def _run_tools(calls: list[dict], on_tool: ToolSink | None) -> list[dict]:
     out = []
     for c in calls:
         result = tools.call(c["name"], c.get("args") or {})
-        log.info("tool %s(%s) -> %s", c["name"], c.get("args"), result.get("ok"))
+        # Arguments carry the caller's email. Logs get shipped, tailed and kept
+        # far longer than a call record, so they get the shape, not the values.
+        log.info("tool %s(%s) -> %s", c["name"], sorted((c.get("args") or {})), result.get("ok"))
         if on_tool:
             await on_tool(c["name"], c.get("args") or {}, result)
         out.append({**c, "result": result})

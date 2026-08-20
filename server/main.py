@@ -12,6 +12,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import secrets
 import time
 from contextlib import asynccontextmanager
 
@@ -21,8 +23,21 @@ from fastapi.middleware.cors import CORSMiddleware
 
 import llm as llm_mod
 import tts
-from config import BYTES_PER_SEC, ECHO_TAIL, RATE_LIMIT_FACTOR, SYSTEM_PROMPT
-from session import STORE, sanitize
+from config import (
+    ALLOWED_ORIGINS,
+    AUTH_TOKEN,
+    BYTES_PER_SEC,
+    ECHO_TAIL,
+    HOST,
+    MAX_CALLS,
+    MAX_TEXT_TURNS,
+    MAX_TURN_CHARS,
+    PORT,
+    RATE_LIMIT_FACTOR,
+    SYSTEM_PROMPT,
+    TEXT_WINDOW,
+)
+from session import STORE, purge_old_calls, sanitize
 from stt import make_stt
 from vad import SpeechGate, pcm_seconds
 
@@ -37,37 +52,62 @@ ENDPOINT_GRACE = 0.35  # wait this long after silence for a straggling transcrip
 async def lifespan(app: FastAPI):
     app.state.http = httpx.AsyncClient()
     app.state.llm = llm_mod.make_llm(app.state.http)
+    app.state.calls = 0
     asyncio.create_task(tts.prewarm())  # pay the TLS handshake before a caller does
     log.info("llm provider: %s", app.state.llm.name)
+    log.info("retention: purged %s expired call records", purge_old_calls())
+    if not AUTH_TOKEN and HOST not in ("127.0.0.1", "localhost", "::1"):
+        log.warning(
+            "SERVING %s WITHOUT AUTH_TOKEN: anyone who can reach this port can "
+            "spend your STT and LLM budget", HOST
+        )
     yield
     await app.state.http.aclose()
 
 
 app = FastAPI(title="Voice AI Support & Qualification Agent", lifespan=lifespan)
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+    CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_methods=["*"], allow_headers=["*"]
 )
 
 
 @app.get("/health")
 async def health() -> dict:
-    return {"ok": True, "llm": app.state.llm.name, "sessions": len(STORE)}
+    # Which model you run and how busy you are is nobody's business but yours.
+    return {"ok": True}
+
+
+def authorized(ws: WebSocket) -> bool:
+    """Gate the websocket by origin and, if configured, a shared secret.
+
+    A websocket is exempt from the same-origin policy: without this check any
+    page on the internet can open a call on your bill. A non-browser client
+    sends no Origin at all, so that case falls through to the token.
+    """
+    origin = ws.headers.get("origin")
+    if origin is not None and "*" not in ALLOWED_ORIGINS and origin not in ALLOWED_ORIGINS:
+        log.warning("rejected websocket from origin %s", origin)
+        return False
+    if AUTH_TOKEN and not secrets.compare_digest(ws.query_params.get("token", ""), AUTH_TOKEN):
+        log.warning("rejected websocket with a bad token")
+        return False
+    return True
 
 
 class RateLimiter:
-    """Cap inbound audio at N x realtime so one socket cannot flood the box."""
+    """Budget per rolling window, so one socket cannot flood the box."""
 
-    def __init__(self, factor: int = RATE_LIMIT_FACTOR) -> None:
-        self.budget = BYTES_PER_SEC * factor
-        self._window = time.monotonic()
-        self._bytes = 0
+    def __init__(self, budget: int, window: float = 1.0) -> None:
+        self.budget, self.window = budget, window
+        self._start = time.monotonic()
+        self._used = 0
 
-    def allow(self, n: int) -> bool:
+    def allow(self, n: int = 1) -> bool:
         now = time.monotonic()
-        if now - self._window >= 1.0:
-            self._window, self._bytes = now, 0
-        self._bytes += n
-        return self._bytes <= self.budget
+        if now - self._start >= self.window:
+            self._start, self._used = now, 0
+        self._used += n
+        return self._used <= self.budget
 
 
 class Call:
@@ -75,7 +115,10 @@ class Call:
         self.ws, self.session, self.llm = ws, session, llm
         self.stt = make_stt()
         self.gate = SpeechGate()
-        self.limiter = RateLimiter()
+        self.audio_limit = RateLimiter(BYTES_PER_SEC * RATE_LIMIT_FACTOR)
+        # Typed turns skip the microphone and so skip the audio budget: without
+        # their own limit one socket can drive the LLM in a tight loop.
+        self.text_limit = RateLimiter(MAX_TEXT_TURNS, TEXT_WINDOW)
         self.speaking: asyncio.Task | None = None
         self.finisher: asyncio.Task | None = None
         self.pending: list[str] = []
@@ -146,9 +189,11 @@ class Call:
         except asyncio.CancelledError:
             log.info("turn interrupted by caller")
             raise
-        except Exception as exc:  # noqa: BLE001 - one bad turn must not drop the call
+        except Exception:  # noqa: BLE001 - one bad turn must not drop the call
+            # The provider's exception text carries its URL, model and response
+            # body. That belongs in the log, not on the caller's socket.
             log.exception("turn failed")
-            await self.send(type="error", message=str(exc))
+            await self.send(type="error", message="the assistant hit an error")
             await self.say("Sorry, I lost that for a second. Could you say it again?")
         finally:
             if spoken:
@@ -176,7 +221,7 @@ class Call:
         self.finisher = asyncio.create_task(self._finish_turn(grace))
 
     async def on_audio(self, pcm: bytes) -> None:
-        if not self.limiter.allow(len(pcm)):
+        if not self.audio_limit.allow(len(pcm)):
             await self.send(type="error", message="audio rate limit exceeded")
             raise WebSocketDisconnect(code=1008)
         self.gate.echo = time.monotonic() < self.play_until + ECHO_TAIL
@@ -226,6 +271,14 @@ class Call:
 
 @app.websocket("/ws")
 async def voice_ws(ws: WebSocket) -> None:
+    if not authorized(ws):
+        await ws.close(code=1008)
+        return
+    if app.state.calls >= MAX_CALLS:
+        log.warning("refused a call: %s already live", app.state.calls)
+        await ws.close(code=1013)  # try again later
+        return
+    app.state.calls += 1
     await ws.accept()
     session = STORE.get(ws.query_params.get("session_id"))
     call = Call(ws, session, app.state.llm)
@@ -252,11 +305,18 @@ async def voice_ws(ws: WebSocket) -> None:
             if (data := msg.get("bytes")) is not None:
                 await call.on_audio(data)
             elif (text := msg.get("text")) is not None:
-                payload = json.loads(text)
+                try:
+                    payload = json.loads(text)
+                except json.JSONDecodeError:
+                    continue  # a malformed frame is not a reason to drop the call
                 kind = payload.get("type")
                 if kind == "text":  # typed turn: same pipeline, no microphone
+                    if not call.text_limit.allow():
+                        await call.send(type="error", message="too many turns; slow down")
+                        break
                     await call.interrupt()
-                    call.speaking = asyncio.create_task(call.respond(payload.get("text", "")))
+                    text = str(payload.get("text") or "")[:MAX_TURN_CHARS]
+                    call.speaking = asyncio.create_task(call.respond(text))
                 elif kind == "end":
                     break
     except WebSocketDisconnect:
@@ -264,6 +324,7 @@ async def voice_ws(ws: WebSocket) -> None:
     except Exception:  # noqa: BLE001
         log.exception("websocket failed")
     finally:
+        app.state.calls -= 1
         reader.cancel()
         record = await call.hangup()
         if record:
@@ -277,4 +338,6 @@ async def voice_ws(ws: WebSocket) -> None:
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    # Loopback and no auto-reload by default: reload watches the tree and forks
+    # a child, which is a development convenience, not a thing to expose.
+    uvicorn.run("main:app", host=HOST, port=PORT, reload=bool(os.getenv("DEV")))
