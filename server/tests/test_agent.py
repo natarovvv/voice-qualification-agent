@@ -13,10 +13,12 @@ import secrets
 import time
 from datetime import datetime, timedelta, timezone
 
+import httpx
 import pytest
 from anyio import ClosedResourceError
 from starlette.websockets import WebSocketDisconnect
 
+import llm
 import main as main_mod
 import metrics
 import session as session_mod
@@ -706,6 +708,196 @@ def test_the_scrape_is_behind_the_token_when_one_is_set(client, monkeypatch):
     assert client.get("/metrics").status_code == 401
     allowed = client.get("/metrics", headers={"authorization": "Bearer s3cret"})
     assert allowed.status_code == 200 and "voice_calls_total" in allowed.text
+
+# ------------------------------------------------------------ provider failover
+
+
+class FakeProvider:
+    """A provider that does what the test tells it to, and counts being asked."""
+
+    def __init__(self, name: str, says: tuple = (), fails: bool = False, tool: str = "") -> None:
+        self.name, self.says, self.fails, self.tool = name, says, fails, tool
+        self.streams = self.summaries = 0
+
+    async def stream(self, system, history, on_tool=None):
+        self.streams += 1
+        if self.tool and on_tool:
+            await on_tool(self.tool, {}, {"ok": True})
+        for chunk in self.says:
+            yield chunk
+        if self.fails:
+            raise RuntimeError(f"{self.name} is down")
+
+    async def json_call(self, system, prompt):
+        self.summaries += 1
+        if self.fails:
+            raise RuntimeError(f"{self.name} is down")
+        return {"answered_by": self.name}
+
+
+def chain(*providers, cooldown: float = 30.0) -> llm.FailoverLLM:
+    return llm.FailoverLLM(list(providers), cooldown=cooldown)
+
+
+async def spoken(llm_, on_tool=None) -> list[str]:
+    """Everything one turn says, in order."""
+    return [d async for d in llm_.stream("sys", [{"role": "user", "content": "hi"}], on_tool)]
+
+
+async def test_a_dead_provider_hands_the_turn_to_the_other_one(fresh_metrics):
+    down, up = FakeProvider("groq", fails=True), FakeProvider("gemini", says=("It is $99.",))
+    both = chain(down, up)
+
+    assert await spoken(both) == ["It is $99."]
+    assert down.streams == 1 and up.streams == 1
+    assert both.name == "groq+gemini"
+
+
+async def test_a_provider_that_already_spoke_keeps_the_turn(fresh_metrics):
+    """A sentence is in the caller's ear the moment it is complete. Handing the
+    rest of the turn over would make the agent say the first half twice."""
+    down = FakeProvider("groq", says=("There are three plans.",), fails=True)
+    up = FakeProvider("gemini", says=("It is $99.",))
+
+    with pytest.raises(RuntimeError):
+        await spoken(chain(down, up))
+    assert up.streams == 0
+
+
+async def test_a_provider_that_already_ran_a_tool_keeps_the_turn(fresh_metrics):
+    """The slot is booked and the confirmation is sent. A second provider
+    starting the turn again would book it twice."""
+    down = FakeProvider("groq", tool="book_calendar_slot", fails=True)
+    up = FakeProvider("gemini", says=("Done.",))
+    ran = []
+
+    async def note(name, args, result):
+        ran.append(name)
+
+    with pytest.raises(RuntimeError):
+        await spoken(chain(down, up), note)
+    assert ran == ["book_calendar_slot"]
+    assert up.streams == 0
+
+
+async def test_a_failed_provider_sits_out_the_next_turn(fresh_metrics):
+    """Paying a dead provider's timeout on every turn of an outage is slower
+    than having no failover at all."""
+    down, up = FakeProvider("groq", fails=True), FakeProvider("gemini", says=("ok",))
+    both = chain(down, up, cooldown=60)
+
+    await spoken(both)
+    await spoken(both)
+    assert down.streams == 1 and up.streams == 2
+
+
+class FakeClock:
+    """A clock the test winds by hand.
+
+    Sleeping past a real cooldown is flaky here: asyncio schedules against the
+    clock's own resolution, which on Windows is ~15 ms, so a timer can fire
+    that much early and a sleep(0.06) can land before a 0.05 deadline. Winding
+    a fake clock also lets one test check both sides of the boundary.
+    """
+
+    def __init__(self, now: float = 1000.0) -> None:
+        self.now = now
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+async def test_the_bench_expires_and_the_faster_provider_gets_it_back(fresh_metrics, monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr(llm, "time", clock)  # llm's name for it, not the stdlib module
+    down, up = FakeProvider("groq", fails=True), FakeProvider("gemini", says=("ok",))
+    both = chain(down, up, cooldown=30)
+
+    await spoken(both)  # groq fails, gemini covers
+    down.fails, down.says = False, ("groq is back",)
+
+    clock.now += 29
+    assert await spoken(both) == ["ok"], "groq is still benched"
+
+    clock.now += 2
+    assert await spoken(both) == ["groq is back"]
+    assert up.streams == 2, "gemini covered while groq sat out, and no longer"
+
+
+async def test_a_barge_in_does_not_bench_a_healthy_provider(fresh_metrics):
+    """Cancelling a turn is the caller interrupting, not the provider failing.
+    CancelledError is a BaseException, which is what keeps it out of the
+    failover's except clause - and this is the test that says so on purpose."""
+    talker = FakeProvider("groq", says=("one", "two", "three"))
+    both = chain(talker, FakeProvider("gemini", says=("ok",)))
+
+    turn = both.stream("sys", [{"role": "user", "content": "hi"}])
+    assert await turn.__anext__() == "one"
+    with pytest.raises(asyncio.CancelledError):
+        await turn.athrow(asyncio.CancelledError)
+
+    assert await spoken(both) == ["one", "two", "three"]
+    assert talker.streams == 2
+
+
+async def test_both_providers_down_still_raises(fresh_metrics):
+    """main.py turns this into the apology line. Swallowing it here would make
+    a total outage look like a working agent."""
+    a, b = FakeProvider("groq", fails=True), FakeProvider("gemini", fails=True)
+
+    with pytest.raises(RuntimeError):
+        await spoken(chain(a, b))
+    assert a.streams == 1 and b.streams == 1
+
+
+async def test_the_end_of_call_summary_fails_over_too(fresh_metrics):
+    down, up = FakeProvider("groq", fails=True), FakeProvider("gemini")
+    answer = await chain(down, up).json_call("sys", "prompt")
+    assert answer["answered_by"] == "gemini"
+
+
+async def test_a_failover_shows_up_in_the_scrape(fresh_metrics):
+    await spoken(chain(FakeProvider("groq", fails=True), FakeProvider("gemini", says=("ok",))))
+
+    got = parse_exposition(metrics.render(active_calls=0))
+    assert got['voice_llm_errors_total{provider="groq"}'] == 1
+    assert got['voice_llm_failovers_total{to="gemini"}'] == 1
+
+async def test_a_streamed_reply_has_a_shorter_deadline_than_the_summary():
+    """A hang has to turn into a failover while the caller is still listening.
+    The end-of-call summary is nobody's wait, so it keeps the long one."""
+    deadlines = []
+
+    async def record(request: httpx.Request) -> httpx.Response:
+        deadlines.append(request.extensions["timeout"])
+        if len(deadlines) == 1:  # the streamed turn
+            return httpx.Response(200, text="data: [DONE]\n\n")
+        return httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(record)) as http:
+        provider = llm.GroqLLM(http, "key")
+        assert await spoken(provider) == []
+        await provider.json_call("sys", "prompt")
+
+    streamed, summary = deadlines
+    assert streamed["read"] == llm.LLM_STREAM_TIMEOUT
+    assert streamed["read"] < summary["read"]
+
+
+def test_the_chain_is_built_from_the_keys_that_are_set(monkeypatch):
+    monkeypatch.setattr(llm, "GROQ_API_KEY", "g")
+    monkeypatch.setattr(llm, "GEMINI_API_KEY", "")
+    assert isinstance(llm.make_llm(None), llm.GroqLLM)  # nothing to fall over to
+
+    monkeypatch.setattr(llm, "GEMINI_API_KEY", "m")
+    assert llm.make_llm(None).name == "groq+gemini"
+
+    monkeypatch.setattr(llm, "LLM_PROVIDER", "gemini")  # preference still steers it
+    assert llm.make_llm(None).name == "gemini+groq"
+
+    monkeypatch.setattr(llm, "GROQ_API_KEY", "")
+    monkeypatch.setattr(llm, "GEMINI_API_KEY", "")
+    assert llm.make_llm(None).name == "offline"
 
 
 def real_deepgram_key() -> str:

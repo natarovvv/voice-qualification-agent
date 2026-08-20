@@ -12,6 +12,14 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "")                      # "groq" | "gemini"; blank = fastest first
+# With both keys set the second provider covers the first. A provider that
+# fails is benched for this long, so an outage costs one turn instead of
+# every turn paying its timeout before falling through.
+LLM_COOLDOWN = float(os.getenv("LLM_COOLDOWN", "30"))              # seconds a failed provider sits out
+# Read timeout while streaming a reply. The caller is waiting on this one,
+# so it is the deadline that decides how fast a hang becomes a failover;
+# Gemini measures 3-5 s to its first token, so it needs the headroom.
+LLM_STREAM_TIMEOUT = float(os.getenv("LLM_STREAM_TIMEOUT", "8"))   # seconds
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")  # 2.0-flash is retired
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")        # llama-3.3-70b is gone
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "tiny.en")

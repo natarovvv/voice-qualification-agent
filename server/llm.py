@@ -3,6 +3,8 @@
 Raw REST over httpx rather than two vendor SDKs: one dependency, one shape,
 no SDK churn. Provider order: Gemini 2.0 Flash -> Groq Llama 3.3 -> offline
 script (so the demo still runs with zero API keys).
+
+With both keys set the two cover each other at runtime - see FailoverLLM.
 """
 from __future__ import annotations
 
@@ -10,17 +12,31 @@ import asyncio
 import json
 import re
 import logging
+import time
 from typing import AsyncIterator, Awaitable, Callable
 
 import httpx
 
+import metrics
 import tools
-from config import GEMINI_API_KEY, GEMINI_MODEL, GROQ_API_KEY, GROQ_MODEL, LLM_PROVIDER
+from config import (
+    GEMINI_API_KEY,
+    GEMINI_MODEL,
+    GROQ_API_KEY,
+    GROQ_MODEL,
+    LLM_COOLDOWN,
+    LLM_PROVIDER,
+    LLM_STREAM_TIMEOUT,
+)
 
 log = logging.getLogger(__name__)
 
 MAX_TOOL_ROUNDS = 3
+# Two deadlines, because they are waited on by different people. The caller is
+# on the line for a streamed reply, so a hang there has to become a failover
+# while they are still listening; the end-of-call summary is nobody's wait.
 TIMEOUT = httpx.Timeout(30.0, connect=5.0)
+STREAM_TIMEOUT = httpx.Timeout(LLM_STREAM_TIMEOUT, connect=5.0)
 ToolSink = Callable[[str, dict, dict], Awaitable[None]]
 
 
@@ -71,7 +87,7 @@ class GeminiLLM:
             pending: list[dict] = []
             model_parts: list[dict] = []
             url = f"{self.base}/{self.model}:streamGenerateContent?alt=sse"
-            async with self.client.stream("POST", url, json=body, headers=self.headers, timeout=TIMEOUT) as resp:
+            async with self.client.stream("POST", url, json=body, headers=self.headers, timeout=STREAM_TIMEOUT) as resp:
                 resp.raise_for_status()
                 async for line in resp.aiter_lines():
                     if not line.startswith("data:"):
@@ -138,7 +154,7 @@ class GroqLLM:
             acc: dict[int, dict] = {}
             text_seen = ""
             async with self.client.stream(
-                "POST", self.url, json=body, headers=self._headers, timeout=TIMEOUT
+                "POST", self.url, json=body, headers=self._headers, timeout=STREAM_TIMEOUT
             ) as resp:
                 resp.raise_for_status()
                 async for line in resp.aiter_lines():
@@ -227,15 +243,97 @@ class OfflineLLM:
         return {"outcome": "offline", "notes": "No LLM provider configured."}
 
 
+class FailoverLLM:
+    """Two providers covering each other, with one rule: never redo a turn.
+
+    A reply is streamed, and a sentence reaches the caller's ear the moment it
+    is complete. So the moment this turn has said a word or run a tool, it
+    belongs to the provider that started it - handing it to the second one
+    would repeat the sentence or book the slot twice. Failing over is only
+    safe before either has happened, which in practice is where providers
+    fail anyway: a 429, a 503, or a socket that never answers.
+
+    A provider that fails is benched for LLM_COOLDOWN. Without that an outage
+    costs its timeout on *every* turn before falling through, which is slower
+    than having no failover at all.
+    """
+
+    def __init__(self, providers: list, cooldown: float = LLM_COOLDOWN) -> None:
+        self.providers = providers
+        self.cooldown = cooldown
+        self._benched: dict[str, float] = {}  # name -> when it may be tried again
+
+    @property
+    def name(self) -> str:
+        return "+".join(p.name for p in self.providers)
+
+    def _order(self) -> list:
+        """Preferred order, with anything still benched moved to the back.
+
+        sorted() is stable, so the healthy ones keep their configured order and
+        so do the benched ones. If everything is benched the order is unchanged
+        and they all get tried anyway - a long shot beats a certain failure.
+        """
+        now = time.monotonic()
+        return sorted(self.providers, key=lambda p: self._benched.get(p.name, 0.0) > now)
+
+    def _bench(self, provider, exc: Exception) -> None:
+        self._benched[provider.name] = time.monotonic() + self.cooldown
+        metrics.count("voice_llm_errors_total", provider=provider.name)
+        log.warning("llm %s failed (%s); benched for %.0fs", provider.name, exc, self.cooldown)
+
+    async def stream(self, system: str, history: list[dict], on_tool: ToolSink | None = None) -> AsyncIterator[str]:
+        order = self._order()
+        for position, provider in enumerate(order):
+            spent = False  # has this attempt done anything a retry would redo?
+
+            async def sink(name: str, args: dict, result: dict) -> None:
+                nonlocal spent
+                spent = True  # a tool has run; its side effects are already out there
+                if on_tool:
+                    await on_tool(name, args, result)
+
+            try:
+                async for delta in provider.stream(system, history, sink):
+                    spent = True
+                    yield delta
+            # CancelledError and GeneratorExit are BaseExceptions and do not
+            # land here, which is what we want: a caller barging in is not a
+            # provider fault and must not bench a healthy one.
+            except Exception as exc:  # noqa: BLE001
+                self._bench(provider, exc)
+                if spent or provider is order[-1]:
+                    raise
+                metrics.count("voice_llm_failovers_total", to=order[position + 1].name)
+                continue
+            return
+
+    async def json_call(self, system: str, prompt: str) -> dict:
+        order = self._order()
+        for position, provider in enumerate(order):
+            try:
+                answer = await provider.json_call(system, prompt)
+            except Exception as exc:  # noqa: BLE001
+                self._bench(provider, exc)
+                if provider is order[-1]:
+                    raise
+                metrics.count("voice_llm_failovers_total", to=order[position + 1].name)
+                continue
+            return answer
+        return {}  # unreachable: providers is never empty
+
+
 def make_llm(client: httpx.AsyncClient):
     # Groq first: measured ~600 ms to first token against Gemini's 3-5 s on the
     # free tier, and the whole turn has 1200 ms. LLM_PROVIDER=gemini flips it.
     order = [("groq", GROQ_API_KEY, GroqLLM), ("gemini", GEMINI_API_KEY, GeminiLLM)]
     if LLM_PROVIDER:
         order.sort(key=lambda p: p[0] != LLM_PROVIDER)
-    for _, key, cls in order:
-        if key:
-            return cls(client, key)
+    live = [cls(client, key) for _, key, cls in order if key]
+    if len(live) > 1:
+        return FailoverLLM(live)
+    if live:
+        return live[0]  # nothing to fail over to; the wrapper would only add a frame
     log.warning("No LLM key set - running the offline script")
     return OfflineLLM()
 

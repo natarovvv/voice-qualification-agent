@@ -23,7 +23,7 @@ browser mic ─ AudioWorklet ─► PCM16 16k ─ websocket ─► VAD ─► ST
 | [server/main.py](server/main.py) | FastAPI websocket, turn taking, barge-in, metrics |
 | [server/vad.py](server/vad.py) | Silero VAD, adaptive-energy fallback, speech gating |
 | [server/stt.py](server/stt.py) | Deepgram Nova-2 stream, faster-whisper fallback |
-| [server/llm.py](server/llm.py) | Groq / Gemini streaming + tool loop, offline fallback |
+| [server/llm.py](server/llm.py) | Groq / Gemini streaming + tool loop, runtime failover |
 | [server/tts.py](server/tts.py) | Deepgram Aura, edge-tts fallback, sentence chunking |
 | [server/tools.py](server/tools.py) | The three tools + JSON schemas |
 | [server/session.py](server/session.py) | TTL session memory, sanitizing, call records |
@@ -67,6 +67,7 @@ Copy `.env.example` to `.env` in the repo root:
 | Key | Without it |
 |---|---|
 | `GROQ_API_KEY` | falls back to Gemini, then to the offline script |
+| both LLM keys | with only one, a provider outage is a failed turn rather than a slower one |
 | `GEMINI_API_KEY` | — |
 | `DEEPGRAM_API_KEY` | STT falls back to local faster-whisper, then to none; the voice falls back to edge-tts |
 | `REDIS_URL` | sessions live in a process-local dict instead of a shared store |
@@ -75,6 +76,34 @@ Copy `.env.example` to `.env` in the repo root:
 Groq is tried first, not Gemini. Measured on the free tiers: Groq returns its
 first token in ~600 ms, Gemini in 3–5 s and it 503s under load, and the whole
 turn has 1200 ms. `LLM_PROVIDER=gemini` flips the order back.
+
+#### Failover
+
+With both keys set the two cover each other during the call, not just at
+startup. A turn whose provider throws is retried on the other one, and the
+caller hears an answer instead of "sorry, I lost that for a second".
+
+**A turn is never redone.** The reply is streamed, and a sentence is in the
+caller's ear the moment it is complete — so once this turn has spoken a word or
+run a tool, it belongs to the provider that started it. Handing it over would
+repeat the sentence, or book the slot twice. Failing over is only safe before
+either has happened, which is where providers fail anyway: a 429, a 503, or a
+socket that never answers.
+
+A provider that fails sits out `LLM_COOLDOWN` (default 30 s). Without that,
+every turn of an outage pays the dead provider's timeout before falling
+through, which is slower than having no failover at all. When the cooldown
+expires the preferred provider gets the next turn back; if both are benched,
+both get tried anyway, because a long shot beats a certain failure.
+
+`LLM_STREAM_TIMEOUT` (default 8 s) is the read deadline while a reply is
+streaming, separate from the 30 s the end-of-call summary keeps. The caller is
+waiting on the first one, so it is what decides how quickly a hang becomes a
+failover; Gemini's 3–5 s to first token is why it is not tighter.
+
+Failovers are visible in `/metrics` as `voice_llm_errors_total{provider}` and
+`voice_llm_failovers_total{to}`. A chain that is quietly limping shows up
+there before it shows up in a call.
 
 One Deepgram key covers both directions: Nova-2 transcribes and Aura speaks.
 Without it the voice falls back to edge-tts, which is fine on a laptop and not
@@ -189,8 +218,9 @@ overhead alone stays under budget with providers mocked.
 ## Observability
 
 `GET /metrics` returns Prometheus text: how busy the box is, how many turns it
-answered, how many of those failed, which tools were called, and how long the
-caller waited to hear something.
+answered, how many of those failed, which tools were called, how often one LLM
+provider had to cover for the other, and how long the caller waited to hear
+something.
 
 ```bash
 curl -H "Authorization: Bearer $AUTH_TOKEN" localhost:8000/metrics
@@ -269,7 +299,11 @@ breaking the code it covers: all thirteen mutations fail the suite. The
 metrics went through the same treatment - eleven mutations, all caught,
 including the one that matters most quietly: `bisect_right` for `bisect_left`,
 which moves a turn landing exactly on the 1200 ms budget from inside it to
-outside.
+outside. Failover is eleven tests and ten more mutations, all caught — that a
+provider which already spoke keeps its turn, that one which already ran a tool
+keeps it too, that a benched provider sits out the next turn and comes back
+when the cooldown is up, and that a caller barging in is not mistaken for a
+provider failing.
 
 Postgres is covered against a real
 PostgreSQL booted from the `pgserver` wheel, including six independent stores
@@ -345,6 +379,11 @@ Data and third parties, which are decisions rather than settings:
   single `curl` behind a load balancer reads one worker's tally, not the fleet's.
   Counters and histogram buckets both sum across workers, so a scraper hitting
   every replica gets the real number; a human with `curl` does not.
+- The LLM cooldown is one failure wide: a single 503 benches a provider for
+  30 s rather than counting failures first. That is deliberate on a free tier
+  where a 503 usually means the next request fails too, but it does mean one
+  unlucky request moves the call to the slower model for half a minute. Count
+  failures before benching if you move to a paid tier where a blip is a blip.
 - The knowledge base stays a file either way. It is content that ships with the
   repo, not caller data.
 - The per-email booking cap is checked inside the transaction but under read
