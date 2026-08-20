@@ -29,11 +29,31 @@ ECHO_THRESHOLD = float(os.getenv("ECHO_THRESHOLD", "0.85"))
 ECHO_START_MS = int(os.getenv("ECHO_START_MS", "400"))
 ECHO_TAIL = int(os.getenv("ECHO_TAIL_MS", "250")) / 1000  # speaker + jitter buffer
 
+# --- who may open a call ---
+# The websocket has no same-origin policy of its own, so an allowlist here is
+# the only thing stopping any page on the internet from spending your STT and
+# LLM budget. "*" turns the check off; do not ship that.
+ALLOWED_ORIGINS = [
+    o.strip() for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",") if o.strip()
+]
+# Shared secret for /ws. Empty = open, which is only safe while HOST is
+# loopback. A browser build has to ship this to the client, so it stops
+# scanners and other people's pages, not a determined caller - real per-user
+# auth needs a login the PRD does not have.
+# ponytail: shared secret; swap for a signed short-lived ticket when there are accounts.
+AUTH_TOKEN = os.getenv("AUTH_TOKEN", "")
+HOST = os.getenv("HOST", "127.0.0.1")
+PORT = int(os.getenv("PORT", "8000"))
+
 # --- limits ---
 SESSION_TTL = int(os.getenv("SESSION_TTL", "1800"))          # seconds
 MAX_TURN_CHARS = 2000                                        # sanitize user text
 MAX_HISTORY_TURNS = 24
 RATE_LIMIT_FACTOR = 4                                        # x realtime audio allowed
+MAX_CALLS = int(os.getenv("MAX_CALLS", "20"))                # concurrent websockets
+MAX_TEXT_TURNS = 10                                          # typed turns per window
+TEXT_WINDOW = 10.0                                           # seconds
+CALL_RETENTION_DAYS = int(os.getenv("CALL_RETENTION_DAYS", "30"))  # 0 = keep forever
 
 DATA_DIR = Path(os.getenv("DATA_DIR", Path(__file__).resolve().parent / "data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)

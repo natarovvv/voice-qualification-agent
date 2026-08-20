@@ -1,19 +1,22 @@
+# Ranges for humans; requirements.lock is the exact tested set. Upper bounds
+# are there so a fresh install cannot silently pull a new major version.
+#
 # --- core (required) ---
-fastapi>=0.115
-uvicorn[standard]>=0.32
-httpx>=0.27
-websockets>=12
-python-dotenv>=1.0
-edge-tts>=6.1
-av>=12.0            # bundled ffmpeg: decodes edge-tts mp3 -> PCM, no system install
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.32,<1.0
+httpx>=0.27,<1.0
+websockets>=12,<18
+python-dotenv>=1.0,<2.0
+edge-tts>=6.1,<8.0
+av>=12.0,<19.0      # bundled ffmpeg: decodes edge-tts mp3 -> PCM, no system install
 
 # --- optional: better VAD (torch is ~200 MB; energy gate runs without it) ---
-silero-vad>=5.1
+silero-vad>=5.1,<6.0
 
 # --- optional: local STT when there is no Deepgram key (numpy is only for this) ---
-faster-whisper>=1.0
-numpy>=1.26
+faster-whisper>=1.0,<2.0
+numpy>=1.26,<3.0
 
 # --- tests ---
-pytest>=8.0
-pytest-asyncio>=0.24
+pytest>=8.0,<10.0
+pytest-asyncio>=0.24,<2.0

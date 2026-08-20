@@ -169,14 +169,48 @@ edge-tts and asserts the decoded PCM is real audio, not silence.
 
 Covers the tools, prompt sanitizing, session TTL and call records, VAD start
 and end detection on synthetic audio, the echo guard opening and closing,
-sentence chunking, and three websocket tests that drive a simulated audio
-turn, a barge-in, and the latency benchmark against mocked providers.
+sentence chunking, and websocket tests that drive a simulated audio turn, a
+barge-in, the latency benchmark against mocked providers, and the access
+checks: a foreign origin, a bad token, a rate-limited typed turn, and session
+ids that would escape the calls directory.
+
+## Security
+
+The defaults assume a laptop: the server binds `127.0.0.1` and auto-reload is
+off unless `DEV=1`. Before it listens anywhere else:
+
+- **Set `AUTH_TOKEN`** and the matching `NEXT_PUBLIC_WS_TOKEN`, and set
+  `ALLOWED_ORIGINS` to your own origin. A websocket is exempt from the
+  same-origin policy, so without these any page on the internet can open a
+  call and spend your Deepgram and LLM budget. The browser token is a gate
+  against other people's pages and against scanners, not against a determined
+  caller — that needs a login this PRD does not have.
+- **Terminate TLS and use `wss://`.** Over `ws://` the microphone audio, the
+  transcript and the caller's email travel in clear text.
+- Session ids are minted by the server (`secrets.token_urlsafe`) and never
+  taken from the query string. A caller-chosen id is one it can guess, and
+  guessing one lends it someone else's transcript and lead data.
+- Limits per socket: audio at 4x realtime, 10 typed turns per 10 s, and
+  `MAX_CALLS` sockets for the whole process.
+
+Data and third parties, which are decisions rather than settings:
+
+- Call records under `server/data/` are plain JSON: transcript, email, company
+  size, summary. No encryption at rest. `CALL_RETENTION_DAYS` (default 30)
+  deletes them at startup; there is no per-caller erasure endpoint yet.
+- Audio goes to Deepgram, text goes to Groq or Gemini, and TTS goes through
+  `edge-tts` — an undocumented consumer Microsoft endpoint with no commercial
+  agreement behind it. Fine for a demo, not something to build a product on:
+  you need a real TTS contract and DPAs with each provider before a live
+  caller's voice reaches any of them.
 
 ## Known corners
 
 - Session memory is a process-local dict. Swap `SessionStore` for Redis before
   running more than one worker.
-- Leads, bookings and the KB are JSON files behind a process lock.
+- Leads, bookings and the KB are JSON files behind a process lock, written
+  temp-file-then-rename so a crash cannot truncate one. The lock is
+  process-local: with more than one worker, move to Postgres.
 - KB search is term overlap, not embeddings.
 - Silero VAD needs torch (~200 MB). Skip it and the adaptive energy gate takes
   over — fine for a headset, worse in a noisy room.

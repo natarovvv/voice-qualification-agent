@@ -81,8 +81,13 @@ export class VoiceClient {
     this.outGain.connect(this.outAnalyser);
     this.outGain.connect(this.ctx.destination);
 
-    const qs = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : "";
-    this.ws = new WebSocket(`${this.url}/ws${qs}`);
+    const qs = new URLSearchParams();
+    if (sessionId) qs.set("session_id", sessionId);
+    // Shipped to the browser, so it is a gate against everyone else's page and
+    // against scanners, not against this page's own user.
+    if (process.env.NEXT_PUBLIC_WS_TOKEN) qs.set("token", process.env.NEXT_PUBLIC_WS_TOKEN);
+    const query = qs.toString();
+    this.ws = new WebSocket(`${this.url}/ws${query ? `?${query}` : ""}`);
     this.ws.binaryType = "arraybuffer";
 
     this.ws.onopen = () => {
