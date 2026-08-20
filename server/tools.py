@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from config import DATA_DIR
-from session import write_json
+from session import CALLS_DIR, write_json
 
 _LOCK = threading.Lock()
 MAX_RECORDS = 5000        # per collection; the file is read whole on every call
@@ -173,6 +173,46 @@ def book_calendar_slot(email: str, datetime_iso: str) -> dict:
         bookings.append(record)
         _save("bookings", bookings)
     return {"ok": True, "confirmation": f"{start:%A %d %B at %H:%M} UTC", **record}
+
+
+def erase_caller(email: str) -> dict:
+    """Delete everything held about one caller, keyed by email address.
+
+    Deliberately NOT in SCHEMAS or REGISTRY: the model must never be able to
+    reach this. A caller who can talk to the agent can say any email address,
+    and prompt injection would turn a support line into a delete button for
+    other people's records.
+
+    A call where the caller never gave an email has no key to match on and so
+    survives; the retention window in session.purge_old_calls is what clears
+    those.
+    """
+    email = (email or "").strip().lower()
+    if not EMAIL_RE.match(email):
+        return {"ok": False, "error": "invalid_email"}
+
+    removed = {}
+    with _LOCK:
+        for name in ("leads", "bookings"):
+            rows = _load(name, [])
+            kept = [r for r in rows if str(r.get("email", "")).lower() != email]
+            removed[name] = len(rows) - len(kept)
+            if removed[name]:
+                _save(name, kept)
+
+        removed["calls"] = 0
+        for f in CALLS_DIR.glob("*.json"):
+            try:
+                rec = json.loads(f.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            lead = rec.get("lead") or {}
+            addresses = {str(lead.get("email", "")).lower(),
+                         str((lead.get("booking") or {}).get("email", "")).lower()}
+            if email in addresses:
+                f.unlink(missing_ok=True)
+                removed["calls"] += 1
+    return {"ok": True, "email": email, "removed": removed}
 
 
 # Words that match everything and therefore mean nothing. Without these,

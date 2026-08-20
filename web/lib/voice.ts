@@ -11,7 +11,7 @@
 export const SAMPLE_RATE = 16000;
 
 export type ServerEvent =
-  | { type: "ready"; session_id: string; stt: string; llm: string }
+  | { type: "ready"; session_id: string; stt: string; tts: string; llm: string }
   | { type: "partial"; text: string }
   | { type: "final"; speaker: string; text: string }
   | { type: "assistant"; text: string }

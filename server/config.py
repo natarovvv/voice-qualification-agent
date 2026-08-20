@@ -15,7 +15,8 @@ LLM_PROVIDER = os.getenv("LLM_PROVIDER", "")                      # "groq" | "ge
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")  # 2.0-flash is retired
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")        # llama-3.3-70b is gone
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "tiny.en")
-TTS_VOICE = os.getenv("TTS_VOICE", "en-US-AriaNeural")
+DEEPGRAM_TTS_MODEL = os.getenv("DEEPGRAM_TTS_MODEL", "aura-2-thalia-en")  # voice = model here
+TTS_VOICE = os.getenv("TTS_VOICE", "en-US-AriaNeural")                    # edge-tts fallback only
 
 # --- audio: PCM 16 kHz 16-bit mono, everywhere, both directions ---
 SAMPLE_RATE = 16000
