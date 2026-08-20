@@ -1,4 +1,4 @@
-# The 55 tests are only worth having if something runs them without being asked.
+# The tests are only worth having if something runs them without being asked.
 #
 # requirements.lock rather than requirements.txt on purpose: the lock is the
 # core path, and requirements.txt would pull silero-vad and faster-whisper -

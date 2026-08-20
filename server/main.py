@@ -20,8 +20,10 @@ from contextlib import asynccontextmanager, suppress
 import httpx
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 
 import llm as llm_mod
+import metrics
 import storage
 import tools
 import tts
@@ -91,6 +93,25 @@ async def health() -> dict:
     return {"ok": True}
 
 
+def bearer_ok(request: Request) -> bool:
+    supplied = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+    return secrets.compare_digest(supplied, AUTH_TOKEN)
+
+
+@app.get("/metrics")
+async def scrape(request: Request) -> PlainTextResponse:
+    """Prometheus exposition, behind the same token as /data when one is set.
+
+    Turn counts and time-to-first-audio say how busy this box is and how well
+    it is holding up, which is exactly the detail /health withholds. With no
+    AUTH_TOKEN the server binds loopback by default and shouts on startup if
+    it does not, so that case is already answered rather than answered twice.
+    """
+    if AUTH_TOKEN and not bearer_ok(request):
+        raise HTTPException(401, "bad token")
+    return PlainTextResponse(metrics.render(app.state.calls))
+
+
 @app.delete("/data")
 async def erase(email: str, request: Request) -> dict:
     """Erase everything held about one caller - the right-to-erasure handle.
@@ -102,8 +123,7 @@ async def erase(email: str, request: Request) -> dict:
     """
     if not AUTH_TOKEN:
         raise HTTPException(503, "set AUTH_TOKEN to enable erasure requests")
-    supplied = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
-    if not secrets.compare_digest(supplied, AUTH_TOKEN):
+    if not bearer_ok(request):
         raise HTTPException(401, "bad token")
 
     result = await asyncio.to_thread(tools.erase_caller, email)
@@ -198,6 +218,7 @@ class Call:
         return f"{SYSTEM_PROMPT}\nAlready established this call: {json.dumps(facts)}"
 
     async def _on_tool(self, name: str, args: dict, result: dict) -> None:
+        metrics.count("voice_tool_calls_total", tool=name, ok=str(result.get("ok", False)).lower())
         self.session.add_tool_call(name, args, result)
         await self.send(type="tool", name=name, args=args, result=result)
 
@@ -206,15 +227,15 @@ class Call:
         await self.send(type="assistant", text=text)
         async for pcm in self.tts.speak(text):
             if first and self.turn_start:
-                await self.send(
-                    type="metric",
-                    first_audio_ms=round((time.monotonic() - self.turn_start) * 1000),
-                )
+                waited = time.monotonic() - self.turn_start
+                metrics.observe_first_audio(waited)
+                await self.send(type="metric", first_audio_ms=round(waited * 1000))
                 self.turn_start = 0.0  # a stale one would time the whole last turn
                 first = False
             await self.send_audio(pcm)
 
     async def respond(self, user_text: str) -> None:
+        metrics.count("voice_turns_total")
         self.session.add_turn("user", user_text)
         await self.send(type="final", speaker="caller", text=user_text)
         buffer, spoken, first = "", [], True
@@ -237,6 +258,7 @@ class Call:
         except Exception:  # noqa: BLE001 - one bad turn must not drop the call
             # The provider's exception text carries its URL, model and response
             # body. That belongs in the log, not on the caller's socket.
+            metrics.count("voice_turn_errors_total")
             log.exception("turn failed")
             await self.send(type="error", message="the assistant hit an error")
             await self.say("Sorry, I lost that for a second. Could you say it again?")
@@ -365,13 +387,16 @@ async def _finalize_later(call: Call) -> None:
 @app.websocket("/ws")
 async def voice_ws(ws: WebSocket) -> None:
     if not authorized(ws):
+        metrics.count("voice_calls_rejected_total", reason="unauthorized")
         await ws.close(code=1008)
         return
     if app.state.calls >= MAX_CALLS:
+        metrics.count("voice_calls_rejected_total", reason="full")
         log.warning("refused a call: %s already live", app.state.calls)
         await ws.close(code=1013)  # try again later
         return
     app.state.calls += 1
+    metrics.count("voice_calls_total")
     await ws.accept()
     requested = ws.query_params.get("session_id")
     # Call off the drop timer before touching the store, while nothing can be

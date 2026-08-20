@@ -27,6 +27,7 @@ browser mic ─ AudioWorklet ─► PCM16 16k ─ websocket ─► VAD ─► ST
 | [server/tts.py](server/tts.py) | Deepgram Aura, edge-tts fallback, sentence chunking |
 | [server/tools.py](server/tools.py) | The three tools + JSON schemas |
 | [server/session.py](server/session.py) | TTL session memory, sanitizing, call records |
+| [server/metrics.py](server/metrics.py) | Prometheus counters and the latency histogram |
 | [server/storage.py](server/storage.py) | Leads and bookings: JSON files or Postgres |
 | [web/](web/) | Next.js 16 UI: meters, transcript, tool log, latency |
 | [web/lib/voice.ts](web/lib/voice.ts) | Mic capture, jitter buffer, barge-in, session resume |
@@ -181,8 +182,43 @@ first token and 400 ms is edge-tts; both are the free tier's floor, so the next
 real gain has to be bought, not coded.
 
 The UI shows measured `first_audio_ms` per turn (silence detected → first byte
-of audio out). `test_typed_turn_latency_under_budget` asserts the
-orchestration overhead alone stays under budget with providers mocked.
+of audio out), and the server keeps the same numbers in a histogram — see
+below. `test_typed_turn_latency_under_budget` asserts the orchestration
+overhead alone stays under budget with providers mocked.
+
+## Observability
+
+`GET /metrics` returns Prometheus text: how busy the box is, how many turns it
+answered, how many of those failed, which tools were called, and how long the
+caller waited to hear something.
+
+```bash
+curl -H "Authorization: Bearer $AUTH_TOKEN" localhost:8000/metrics
+```
+
+It is behind the same token as `/data` whenever `AUTH_TOKEN` is set. Turn
+counts and latency are exactly the operational detail `/health` withholds. With
+no token the server binds loopback by default and shouts at startup if it does
+not, so that case is already answered rather than answered twice.
+
+`voice_first_audio_seconds` is a histogram whose boundaries bracket the 1200 ms
+budget, so the share of turns inside it reads off a single bucket with no
+scraper at all:
+
+```bash
+curl -s -H "Authorization: Bearer $AUTH_TOKEN" localhost:8000/metrics \
+  | awk '/le="1.2"/ {ok=$2} /_seconds_count/ {print $2 ? ok/$2 : "no turns yet"}'
+```
+
+A histogram rather than a running p95, because percentiles do not average: an
+in-process p95 stops meaning anything the moment there is a second worker,
+while bucket counts add up across workers and the scraper takes the quantile
+from the sum. `histogram_quantile(0.95, rate(voice_first_audio_seconds_bucket[5m]))`
+is the p95 once something is scraping.
+
+Only spoken turns are timed. A typed turn has no moment of silence to measure
+from, so it is counted in `voice_turns_total` and left out of the histogram
+rather than logged as a suspiciously fast one.
 
 ## Tests
 
@@ -212,7 +248,12 @@ ids that would escape the calls directory. The Redis store is covered against
 been run against a live `redis-server`. Resume is covered end to end: a socket
 that dies writes no record, a reconnect gets the same session and its first
 half back, an abandoned call is written out when the grace expires, and a
-deliberate hangup is not resumable.
+deliberate hangup is not resumable. The metrics endpoint is covered by a real
+call: a spoken turn moves the turn counter, the tool counter and the histogram
+together, and the number the histogram holds is the same one the caller's
+browser was sent. A turn that blows up is counted both as a turn and as a
+failure, and a call turned away for capacity is counted as rejected and *not*
+as served, so a busy box cannot flatter its own latency by dropping traffic.
 
 The browser half is 21 Vitest tests over jsdom. They cover what the client
 tells the browser to do rather than what it renders: chunks of the agent's
@@ -224,7 +265,11 @@ microphone still leaving a usable call, and the session id being kept across a
 drop and forgotten on a real hangup. The capture worklet is tested through a
 `postMessage` that genuinely detaches the transferred buffer, because that is
 what turns a missing `.slice()` into silence. Every one of these was checked by
-breaking the code it covers: all thirteen mutations fail the suite.
+breaking the code it covers: all thirteen mutations fail the suite. The
+metrics went through the same treatment - eleven mutations, all caught,
+including the one that matters most quietly: `bisect_right` for `bisect_left`,
+which moves a turn landing exactly on the 1200 ms budget from inside it to
+outside.
 
 Postgres is covered against a real
 PostgreSQL booted from the `pgserver` wheel, including six independent stores
@@ -263,6 +308,9 @@ Data and third parties, which are decisions rather than settings:
   agreement behind it; the server logs a warning when it does. Keep that path
   for development only, and get DPAs with Deepgram and your LLM provider before
   a live caller's voice reaches either.
+- **Metrics:** `GET /metrics` is behind `Authorization: Bearer $AUTH_TOKEN`
+  when one is set. Call volume and latency are not caller data, but they are a
+  free read on how much traffic you carry and when you are struggling.
 - **Erasure requests:** `DELETE /data?email=...` with `Authorization: Bearer
   $AUTH_TOKEN` deletes that caller's leads, bookings and call records and
   reports what it removed. It is refused outright unless `AUTH_TOKEN` is set,
@@ -292,6 +340,11 @@ Data and third parties, which are decisions rather than settings:
   gist` constraint rather than an application check — the database refuses the
   second booking whoever asks. With `DATABASE_URL` and `REDIS_URL` both set,
   more than one worker is safe.
+- Metrics are per-process and start at zero on restart, which is the normal
+  shape for a scrape endpoint — the scraper keeps the history. It does mean a
+  single `curl` behind a load balancer reads one worker's tally, not the fleet's.
+  Counters and histogram buckets both sum across workers, so a scraper hitting
+  every replica gets the real number; a human with `curl` does not.
 - The knowledge base stays a file either way. It is content that ships with the
   repo, not caller data.
 - The per-email booking cap is checked inside the transaction but under read
