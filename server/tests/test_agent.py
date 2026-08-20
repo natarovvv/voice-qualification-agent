@@ -112,21 +112,162 @@ def test_history_is_trimmed_but_transcript_is_not():
 
 def test_session_store_expires_by_ttl():
     store = session_mod.SessionStore(ttl=0.05)
-    first = store.get(None)
-    assert store.get(first.id) is first
+    first = asyncio.run(store.get(None))
+    assert asyncio.run(store.get(first.id)) is first
     time.sleep(0.1)
     assert store.sweep() == 1
-    assert store.get(first.id) is not first
+    assert asyncio.run(store.get(first.id)) is not first
 
 
-def test_session_id_is_minted_by_the_server_not_the_caller():
+@pytest.mark.parametrize("kind", ["memory", "redis"])
+def test_session_id_is_minted_by_the_server_not_the_caller(kind, redis_store):
     """An id the caller picks is an id it can guess - someone else's call."""
-    store = session_mod.SessionStore()
-    squatter = store.get("guessable")
-    assert squatter.id != "guessable"
-    assert len(squatter.id) >= 16
-    # and the id it did pick is not resumable by guessing it either
-    assert store.get("guessable") is not squatter
+    store = session_mod.SessionStore() if kind == "memory" else redis_store()
+
+    async def drive():
+        squatter = await store.get("guessable")
+        assert squatter.id != "guessable"
+        assert len(squatter.id) >= 16
+        # and the id it did pick is not resumable by guessing it either
+        assert await store.get("guessable") is not squatter
+
+    asyncio.run(drive())
+
+
+# --------------------------------------------------------------- redis store
+
+
+@pytest.fixture
+def redis_store(monkeypatch):
+    """RedisSessionStore built the real way, with fakeredis behind from_url.
+
+    Real command semantics and the real constructor; no server. Nothing in
+    this suite runs against a live redis-server.
+    """
+    import fakeredis.aioredis
+    import redis.asyncio
+
+    shared = fakeredis.FakeServer()
+    monkeypatch.setattr(
+        redis.asyncio,
+        "from_url",
+        lambda url, **kw: fakeredis.aioredis.FakeRedis(server=shared, **kw),
+    )
+
+    def build(ttl: int = session_mod.SESSION_TTL):
+        return session_mod.RedisSessionStore(url="redis://localhost", ttl=ttl)
+
+    def peek(session_id: str):
+        """Read the shared server the way another process would.
+
+        Not through store.redis: that client is bound to whichever event loop
+        the app is running on, and reading it from a second loop returns
+        nothing at all.
+        """
+
+        async def read():
+            client = fakeredis.aioredis.FakeRedis(server=shared, decode_responses=True)
+            return await client.get(f"session:{session_id}")
+
+        return asyncio.run(read())
+
+    build.peek = peek
+    return build
+
+
+def test_redis_store_hands_a_session_to_a_second_worker(redis_store):
+    """The point of the shared store: another process picks the call back up."""
+
+    async def drive():
+        worker = redis_store  # each build() is a separate store on one server
+
+        first = worker()
+        s = await first.get(None)
+        s.add_turn("user", "my email is cto@acme.io")
+        s.add_tool_call("check_lead_qualification", {}, {"ok": True, "email": "cto@acme.io",
+                        "company_size": 600, "tier": "hot", "score": 80, "qualified": True})
+        await first.put(s)
+
+        second = worker()  # a different process entirely: nothing in its dict
+        resumed = await second.get(s.id)
+        assert resumed is not s
+        assert resumed.id == s.id
+        assert [t["content"] for t in resumed.history] == ["my email is cto@acme.io"]
+        assert resumed.facts["tier"] == "hot"
+
+        await second.drop(s.id)
+        assert (await worker().get(s.id)).id != s.id, "a dropped session must not come back"
+
+    asyncio.run(drive())
+
+
+def test_full_call_runs_through_the_redis_store(monkeypatch, redis_store):
+    """The whole websocket path against the shared store, not just the store."""
+    from fastapi.testclient import TestClient
+
+    import main
+
+    store = redis_store()
+    monkeypatch.setattr(main, "STORE", store)
+    monkeypatch.setattr(main, "make_stt", lambda: FakeSTT())
+    monkeypatch.setattr(main.tts, "make_tts", lambda: FakeTTS())
+
+    with TestClient(main.app) as c, c.websocket_connect("/ws") as ws:
+        ready, _ = collect(ws, "ready")
+        sid = ready["session_id"]
+        ws.send_text(json.dumps({"type": "text", "text": "what does it cost"}))
+        collect(ws, "assistant")
+
+        # the turn is persisted when it finishes, which is after the last chunk
+        # of its audio has gone out; poll rather than guess at the chunk count
+        raw = None
+        for _ in range(60):
+            raw = redis_store.peek(sid)
+            if raw:
+                break
+            time.sleep(0.05)
+        assert raw, "a finished turn never reached the shared store"
+        assert "what does it cost" in raw
+
+        ws.send_text(json.dumps({"type": "end"}))
+        collect(ws, "summary")
+
+    assert redis_store.peek(sid) is None, "the ended call was left in the store"
+
+
+def test_redis_store_survives_redis_falling_over_mid_call(redis_store):
+    """A dead cache must degrade to the in-memory behaviour, not lose the
+    caller's history in the middle of a sentence."""
+    store = redis_store()
+
+    async def drive():
+        s = await store.get(None)
+        s.add_turn("user", "what does it cost")
+
+        class Broken:
+            async def get(self, *a, **k): raise ConnectionError("redis is gone")
+            async def set(self, *a, **k): raise ConnectionError("redis is gone")
+            async def delete(self, *a, **k): raise ConnectionError("redis is gone")
+
+        store.redis = Broken()
+        await store.put(s)                       # must not raise
+        assert await store.get(s.id) is s, "the live call lost its own session"
+
+    asyncio.run(drive())
+
+
+def test_redis_store_refuses_a_session_whose_id_would_escape(redis_store):
+    """Whatever is in the cache is input too: a poisoned value must not come
+    back as an id that writes outside the calls directory."""
+    store = redis_store()
+
+    async def drive():
+        await store.redis.set("session:evil", json.dumps({"id": "../../../pwned"}))
+        got = await store.get("evil")
+        assert got.id != "../../../pwned"
+        assert session_mod._SAFE_ID.fullmatch(got.id)
+
+    asyncio.run(drive())
 
 
 @pytest.mark.parametrize("bad", ["../../../etc/passwd", "..\..\win.ini", "a/b", "x.json", ""])

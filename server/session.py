@@ -1,15 +1,24 @@
-"""In-memory session store with TTL, plus the end-of-call record writer.
+"""Session store with TTL, plus the end-of-call record writer.
 
-PRD allows "Redis / in-memory dict with TTL". One process, one dict.
-ponytail: swap ``SessionStore`` for Redis when you run more than one worker.
+PRD allows "Redis / in-memory dict with TTL", and both are here: set REDIS_URL
+for the shared one, leave it unset for a process-local dict. Same async
+interface either way, so the call path does not know which it got.
+
+Note what Redis does and does not buy. A call lives on one worker for its whole
+life, and hangup() ends the session on any disconnect, so nothing is contended
+between workers today - Redis makes an interrupted call recoverable rather than
+making a second worker safe. The thing that actually blocks a second worker is
+in tools.py: leads and bookings are JSON files behind a threading.Lock, which
+is process-local and does not stop two workers from clobbering each other.
 """
 from __future__ import annotations
 
 import json
+import logging
 import re
 import secrets
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
@@ -18,8 +27,11 @@ from config import (
     DATA_DIR,
     MAX_HISTORY_TURNS,
     MAX_TURN_CHARS,
+    REDIS_URL,
     SESSION_TTL,
 )
+
+log = logging.getLogger(__name__)
 
 CALLS_DIR = DATA_DIR / "calls"
 CALLS_DIR.mkdir(parents=True, exist_ok=True)
@@ -148,35 +160,132 @@ class Session:
         return rec
 
 
+def _new_session() -> Session:
+    """The caller never chooses an id. An id it can choose is an id it can
+    guess, and guessing one lends it someone else's transcript and lead data."""
+    return Session(id=secrets.token_urlsafe(18))
+
+
+def _evict(items: dict[str, Session], ttl: int, now: float | None = None) -> int:
+    now = now or time.time()
+    dead = [k for k, v in items.items() if now - v.touched_at > ttl]
+    for k in dead:
+        del items[k]
+    return len(dead)
+
+
 class SessionStore:
+    """One process, one dict. The default."""
+
+    name = "memory"
+
     def __init__(self, ttl: int = SESSION_TTL) -> None:
         self.ttl = ttl
         self._items: dict[str, Session] = {}
 
-    def get(self, session_id: str | None) -> Session:
-        """Resume a live session, or mint a new one.
-
-        The caller never chooses an id. An id it can choose is an id it can
-        guess, and guessing one lends it someone else's transcript, lead data
-        and end-of-call record.
-        """
+    async def get(self, session_id: str | None) -> Session:
+        """Resume a live session, or mint a new one."""
         self.sweep()
         s = self._items.get(session_id) if session_id else None
         if s is None or s.ended:
-            s = Session(id=secrets.token_urlsafe(18))
+            s = _new_session()
             self._items[s.id] = s
         s.touch()
         return s
 
+    async def put(self, session: Session) -> None:
+        """Already by reference; nothing to write."""
+
+    async def drop(self, session_id: str) -> None:
+        self._items.pop(session_id, None)
+
     def sweep(self, now: float | None = None) -> int:
-        now = now or time.time()
-        dead = [k for k, v in self._items.items() if now - v.touched_at > self.ttl]
-        for k in dead:
-            del self._items[k]
-        return len(dead)
+        return _evict(self._items, self.ttl, now)
 
     def __len__(self) -> int:
         return len(self._items)
 
 
-STORE = SessionStore()
+class RedisSessionStore:
+    """The same store, shared, so an interrupted call is recoverable.
+
+    Sessions the worker is currently serving stay in a local dict as well: that
+    copy is the newest one while its websocket is open, and it means a Redis
+    outage degrades to exactly the in-memory behaviour instead of dropping the
+    caller's history mid-sentence. Redis expiry replaces the manual sweep for
+    the shared copy; the local one is still swept, or an abandoned call would
+    sit in it forever.
+    """
+
+    name = "redis"
+
+    def __init__(self, url: str = REDIS_URL, ttl: int = SESSION_TTL) -> None:
+        import redis.asyncio
+
+        self.ttl = ttl
+        # from_url does not connect here - the pool dials on the first command,
+        # so a Redis that is down cannot stop the process from starting.
+        self.redis = redis.asyncio.from_url(url, decode_responses=True)
+        self._live: dict[str, Session] = {}
+
+    @staticmethod
+    def _key(session_id: str) -> str:
+        return f"session:{session_id}"
+
+    async def get(self, session_id: str | None) -> Session:
+        _evict(self._live, self.ttl)
+        s = None
+        if session_id:
+            s = self._live.get(session_id) or await self._load(session_id)
+        if s is None or s.ended:
+            s = _new_session()
+        self._live[s.id] = s
+        s.touch()
+        return s
+
+    async def _load(self, session_id: str) -> Session | None:
+        try:
+            raw = await self.redis.get(self._key(session_id))
+        except Exception as exc:  # noqa: BLE001 - a dead cache must not refuse the call
+            log.warning("redis read failed; starting a fresh session: %s", exc)
+            return None
+        if not raw:
+            return None
+        try:
+            # Session validates its own id, so a hostile or corrupted value
+            # cannot come back as something that escapes the calls directory.
+            return Session(**json.loads(raw))
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            log.warning("unreadable session %s in redis: %s", session_id[:8], exc)
+            return None
+
+    async def put(self, session: Session) -> None:
+        self._live[session.id] = session
+        try:
+            await self.redis.set(
+                self._key(session.id), json.dumps(asdict(session)), ex=self.ttl
+            )
+        except Exception as exc:  # noqa: BLE001 - the call continues from memory
+            log.warning("redis write failed: %s", exc)
+
+    async def drop(self, session_id: str) -> None:
+        self._live.pop(session_id, None)
+        try:
+            await self.redis.delete(self._key(session_id))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("redis delete failed: %s", exc)
+
+    def __len__(self) -> int:
+        return len(self._live)
+
+
+def make_store():
+    if REDIS_URL:
+        try:
+            return RedisSessionStore()
+        except ImportError:
+            log.warning("REDIS_URL is set but redis is not installed; using memory")
+    return SessionStore()
+
+
+STORE = make_store()

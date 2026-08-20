@@ -59,6 +59,7 @@ Copy `.env.example` to `.env` in the repo root:
 | `GROQ_API_KEY` | falls back to Gemini, then to the offline script |
 | `GEMINI_API_KEY` | — |
 | `DEEPGRAM_API_KEY` | STT falls back to local faster-whisper, then to none; the voice falls back to edge-tts |
+| `REDIS_URL` | sessions live in a process-local dict instead of a shared store |
 
 Groq is tried first, not Gemini. Measured on the free tiers: Groq returns its
 first token in ~600 ms, Gemini in 3–5 s and it 503s under load, and the whole
@@ -181,7 +182,9 @@ and end detection on synthetic audio, the echo guard opening and closing,
 sentence chunking, and websocket tests that drive a simulated audio turn, a
 barge-in, the latency benchmark against mocked providers, and the access
 checks: a foreign origin, a bad token, a rate-limited typed turn, and session
-ids that would escape the calls directory.
+ids that would escape the calls directory. The Redis store is covered against
+`fakeredis` - real command semantics, real constructor, but nothing here has
+been run against a live `redis-server`.
 
 ## Security
 
@@ -224,11 +227,19 @@ Data and third parties, which are decisions rather than settings:
 
 ## Known corners
 
-- Session memory is a process-local dict. Swap `SessionStore` for Redis before
-  running more than one worker.
-- Leads, bookings and the KB are JSON files behind a process lock, written
-  temp-file-then-rename so a crash cannot truncate one. The lock is
-  process-local: with more than one worker, move to Postgres.
+- Session memory is a process-local dict unless `REDIS_URL` is set, in which
+  case sessions are shared and expire on Redis's own TTL. Be clear about what
+  that buys: a call lives on one worker for its whole life and `hangup()` ends
+  the session on any disconnect, so nothing is contended between workers -
+  Redis makes an interrupted call recoverable, it does not make a second
+  worker safe. Sessions the worker is serving stay in a local dict too, so a
+  Redis outage degrades to the single-process behaviour instead of dropping
+  the caller's history mid-sentence.
+- **The actual blocker for a second worker is storage, not sessions.** Leads,
+  bookings and the KB are JSON files behind a `threading.Lock`, written
+  temp-file-then-rename so a crash cannot truncate one. That lock is
+  process-local and does nothing across processes: two workers will lose each
+  other's writes. Move to Postgres before running more than one.
 - KB search is term overlap, not embeddings.
 - edge-tts remains the keyless fallback and is development-only; see Security.
 - Silero VAD needs torch (~200 MB). Skip it and the adaptive energy gate takes
