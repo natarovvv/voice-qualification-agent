@@ -38,7 +38,7 @@ function Meter({ level, label, hue }: { level: number; label: string; hue: strin
 
 export default function Home() {
   const clientRef = useRef<VoiceClient | null>(null);
-  const [state, setState] = useState<"idle" | "connecting" | "live" | "closed">("idle");
+  const [state, setState] = useState<"idle" | "connecting" | "live" | "reconnecting" | "closed">("idle");
   const [lines, setLines] = useState<Line[]>([]);
   const [partial, setPartial] = useState("");
   const [tools, setTools] = useState<ToolLog[]>([]);
@@ -67,6 +67,11 @@ export default function Home() {
         // A different id than we asked for means the old call was already
         // closed out, so what is on screen belongs to nothing.
         if (wanted.current && wanted.current !== e.session_id) clearLog();
+        // Every later ready is compared against what the server actually
+        // called this call, not against what the Start button asked for: a
+        // redial after the grace expired comes back as a different call, and
+        // the log on screen belongs to the one that is gone.
+        wanted.current = e.session_id;
         sessionStorage.setItem(SESSION_KEY, e.session_id);
         break;
       case "partial":
@@ -139,6 +144,9 @@ export default function Home() {
   }
 
   const live = state === "live";
+  // A dropped call is redialling itself, so the call is not over and Start is
+  // not the button that helps. End is: the caller may want to give up on it.
+  const busy = state === "connecting" || state === "reconnecting";
   const worst = latency.length ? Math.max(...latency) : 0;
   const avg = latency.length ? Math.round(latency.reduce((a, b) => a + b, 0) / latency.length) : 0;
 
@@ -163,13 +171,13 @@ export default function Home() {
       </section>
 
       <section className="controls">
-        {live ? (
+        {live || state === "reconnecting" ? (
           <button className="danger" onClick={stop}>
             End call
           </button>
         ) : (
-          <button onClick={start} disabled={state === "connecting"}>
-            {state === "connecting" ? "Connecting…" : "Start call"}
+          <button onClick={start} disabled={busy}>
+            {busy ? "Connecting…" : "Start call"}
           </button>
         )}
         <form

@@ -6,6 +6,7 @@ from __future__ import annotations
 import array
 import asyncio
 import json
+import logging
 import math
 import os
 import pathlib
@@ -27,7 +28,7 @@ import storage
 import tools
 import tts
 import vad
-from config import SAMPLE_RATE
+from config import RATE_LIMIT_FACTOR, SAMPLE_RATE
 
 # --------------------------------------------------------------- audio fixtures
 
@@ -1010,6 +1011,40 @@ def test_websocket_rejects_a_bad_token(client, monkeypatch):
     assert caught.value.code == 1008
     with client.websocket_connect("/ws?token=s3cret") as ws:
         collect(ws, "ready")
+
+
+def test_a_caller_who_blows_the_audio_budget_is_told_not_to_come_back(client):
+    """1008 rather than a plain close, because the browser redials a call that
+    dropped. A rate limit the client reconnects straight into is not one."""
+    with client.websocket_connect("/ws") as ws:
+        collect(ws, "ready")
+        # one frame over the whole budget, so no amount of slowness on this
+        # machine can let the rolling window turn over underneath it
+        ws.send_bytes(tone(RATE_LIMIT_FACTOR + 1.0))
+        closed = None
+        for _ in range(60):
+            msg = ws.receive()
+            if msg["type"] == "websocket.close":
+                closed = msg["code"]
+                break
+    assert closed == 1008, f"the browser was told {closed}, and 1008 is the one it obeys"
+
+
+def test_a_socket_the_caller_already_closed_does_not_escape_the_handler(client, caplog, monkeypatch):
+    """The last thing a call does is close a socket, and by then the caller is
+    often gone - starlette raises rather than shrugging. Routine now that the
+    browser redials: every drop ends exactly this way."""
+    import starlette.websockets
+
+    async def already_gone(self, code: int = 1000, reason: str | None = None):
+        raise WebSocketDisconnect(1006)
+
+    monkeypatch.setattr(starlette.websockets.WebSocket, "close", already_gone)
+    with caplog.at_level(logging.ERROR):
+        with client.websocket_connect("/ws") as ws:
+            collect(ws, "ready")
+            ws.send_text(json.dumps({"type": "end"}))
+    assert not caplog.records, f"the handler raised on the way out: {caplog.text}"
 
 
 def test_barge_in_resets_the_voice(client):

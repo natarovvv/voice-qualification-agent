@@ -105,4 +105,29 @@ describe("session resume", () => {
     await ready("S2");
     expect(client().started).toBeUndefined();
   });
+
+  it("clears the log when a redial the client made itself lands in a new call", async () => {
+    render(<Home />);
+    await ready("S1");
+    await said("what does it cost");
+
+    // nobody pressed Start: the client redialled, and the grace had expired
+    await settle(() => client().h.onState("reconnecting"));
+    await settle(() =>
+      client().h.onEvent({ type: "ready", session_id: "S2", stt: "x", tts: "y", llm: "z" }),
+    );
+    expect(screen.queryByText(/what does it cost/)).toBeNull();
+    expect(sessionStorage.getItem(SESSION_KEY)).toBe("S2");
+  });
+
+  it("offers End call while the client is redialling", async () => {
+    render(<Home />);
+    await ready("S1");
+    await settle(() => client().h.onState("reconnecting"));
+
+    // the call is not over, so Start is not the button that helps - but the
+    // caller has to be able to give up on it
+    expect(screen.queryByRole("button", { name: /start call/i })).toBeNull();
+    expect(screen.getByRole("button", { name: /end call/i })).toBeTruthy();
+  });
 });

@@ -435,6 +435,9 @@ async def voice_ws(ws: WebSocket) -> None:
         log.exception("stt failed to start; typed turns still work")
 
     clean = False  # did the caller hang up, or did the socket just die?
+    # What the browser is told on the way out. It matters now that the client
+    # redials a call that dropped: 1008 is the one code that means do not.
+    code = 1000
     try:
         while True:
             msg = await ws.receive()
@@ -459,8 +462,12 @@ async def voice_ws(ws: WebSocket) -> None:
                 elif kind == "end":
                     clean = True
                     break
-    except WebSocketDisconnect:
-        pass
+    except WebSocketDisconnect as exc:
+        # Raised by starlette when the caller's socket went away, and by
+        # on_audio when the caller blew the rate limit - and in that second
+        # case the code is the whole point, so pass it on rather than closing
+        # 1000 and inviting the client straight back.
+        code = exc.code or 1000
     except Exception:  # noqa: BLE001
         log.exception("websocket failed")
     finally:
@@ -470,8 +477,12 @@ async def voice_ws(ws: WebSocket) -> None:
         if record:
             await call.send(type="summary", record=record)
         try:
-            await ws.close()
-        except RuntimeError:
+            await ws.close(code=code)
+        except (RuntimeError, WebSocketDisconnect):
+            # RuntimeError: this side already closed it. WebSocketDisconnect:
+            # the other side did, and starlette raises rather than shrugging.
+            # The second one is every dropped call, which is routine now that
+            # the browser redials - and a traceback per drop is not.
             pass
 
 
