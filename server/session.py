@@ -18,6 +18,8 @@ setting that fixes that one.
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 import re
@@ -107,6 +109,28 @@ def unseal(blob: Any, where: str = "record") -> Any:
         return json.loads(CIPHER.decrypt(blob["data"].encode()))
     except Exception as exc:  # noqa: BLE001 - InvalidToken, and anything else
         raise Unreadable(f"{where}: {type(exc).__name__}") from exc
+
+
+def blind(email: str) -> list[str]:
+    """Every form a stored address can have, the one to write first.
+
+    Fernet is randomised on purpose, so ``WHERE email = 'a@b.io'`` cannot find
+    a sealed address and no index can help it. An HMAC under the same keys can
+    be matched and indexed, and it rotates the way sealing does: a row is
+    written under the first key and found under any of them, so yesterday's
+    rows stay erasable after a rotation. The label keeps this use of the key
+    apart from Fernet's own.
+
+    Nothing reads an address back out of this - that is what the sealed
+    payload beside it is for. Equality is all a hash owes anyone.
+    """
+    plain = (email or "").strip().lower()
+    if not CALL_ENCRYPTION_KEYS:
+        return [plain]
+    return [
+        hmac.new(k.encode(), b"blind-index:" + plain.encode("utf-8"), hashlib.sha256).hexdigest()
+        for k in CALL_ENCRYPTION_KEYS
+    ]
 
 
 def read_record(path) -> dict:

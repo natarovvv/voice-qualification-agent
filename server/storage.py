@@ -12,6 +12,13 @@ second booking no matter how many workers ask at once. That is the invariant
 moving out of application code and into the one place that can actually hold
 it.
 
+Both backends seal what they hold when CALL_ENCRYPTION_KEY is set. A file is
+sealed whole. A row cannot be, because the index and the overlap constraint
+have to keep working on it, so the address becomes an HMAC the index can still
+match - see session.blind - and the address itself goes sealed into a column
+of its own. Nothing ever reads it back here; equality is all these queries
+ever asked of it.
+
 The knowledge base is not here. It is content rather than caller data, and it
 stays a file that ships with the repo.
 """
@@ -24,7 +31,7 @@ from datetime import datetime
 from typing import Any
 
 from config import DATABASE_URL, DATA_DIR
-from session import Unreadable, seal, unseal, write_json
+from session import Unreadable, blind, seal, unseal, write_json
 
 log = logging.getLogger(__name__)
 
@@ -33,8 +40,14 @@ MAX_RECORDS = 5000  # json backend only; the file is read whole on every call
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS leads (
     id           bigserial PRIMARY KEY,
+    -- Not the address. session.blind's HMAC of it when a key is set, the
+    -- address itself when not: equality and an index still work, reading it
+    -- back does not, and that is the whole trade.
     email        text        NOT NULL,
-    domain       text        NOT NULL,
+    -- The address itself, sealed. Also where the domain went - it is
+    -- email.split("@")[1] and nothing more, so a column of its own was a
+    -- second copy of the same personal datum sitting in the clear.
+    contact      jsonb,
     company_size integer     NOT NULL,
     score        integer     NOT NULL,
     tier         text        NOT NULL,
@@ -46,7 +59,11 @@ CREATE INDEX IF NOT EXISTS leads_email_idx ON leads (email);
 
 CREATE TABLE IF NOT EXISTS bookings (
     id        bigserial PRIMARY KEY,
-    email     text        NOT NULL,
+    email     text        NOT NULL,  -- the same lookup value, for the same reason
+    contact   jsonb,
+    -- These two stay in the clear because the constraint below is the reason
+    -- this table exists, and a range index cannot read ciphertext. A slot is
+    -- not personal data on its own; who is in it is, and that is sealed.
     start_at  timestamptz NOT NULL,
     end_at    timestamptz NOT NULL,
     booked_at timestamptz NOT NULL DEFAULT now(),
@@ -58,6 +75,13 @@ CREATE TABLE IF NOT EXISTS bookings (
         EXCLUDE USING gist (tstzrange(start_at, end_at) WITH &&)
 );
 CREATE INDEX IF NOT EXISTS bookings_email_idx ON bookings (email);
+
+-- Tables that predate all of the above. Dropping domain loses nothing: those
+-- rows still hold their address in the clear, and the domain is a substring
+-- of it.
+ALTER TABLE leads    ADD COLUMN IF NOT EXISTS contact jsonb;
+ALTER TABLE leads    DROP COLUMN IF EXISTS domain;
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS contact jsonb;
 """
 
 
@@ -152,19 +176,22 @@ class PostgresStore:
         self.ensure_schema()
         with self.pool.connection() as conn:
             conn.execute(
-                "INSERT INTO leads (email, domain, company_size, score, tier, reasons,"
+                "INSERT INTO leads (email, contact, company_size, score, tier, reasons,"
                 " qualified, checked_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
                 (
-                    record["email"], record["domain"], record["company_size"],
-                    record["score"], record["tier"], Json(record["reasons"]),
-                    record["qualified"], record["checked_at"],
+                    blind(record["email"])[0],
+                    Json(seal({"email": record["email"], "domain": record["domain"]})),
+                    record["company_size"], record["score"], record["tier"],
+                    Json(record["reasons"]), record["qualified"], record["checked_at"],
                 ),
             )
 
     def book(self, record: dict, slot_minutes: int, cap: int) -> str | None:
         import psycopg
+        from psycopg.types.json import Json
 
         self.ensure_schema()
+        lookups = blind(record["email"])
         try:
             with self.pool.connection() as conn, conn.transaction():
                 # ponytail: read-committed, so two simultaneous bookings can
@@ -172,14 +199,15 @@ class PostgresStore:
                 # money; the overlap below is the invariant that has to hold,
                 # and that one the constraint enforces whatever happens here.
                 taken = conn.execute(
-                    "SELECT count(*) FROM bookings WHERE email = %s", (record["email"],)
+                    "SELECT count(*) FROM bookings WHERE email = ANY(%s)", (lookups,)
                 ).fetchone()[0]
                 if taken >= cap:
                     return "too_many_bookings"
                 conn.execute(
-                    "INSERT INTO bookings (email, start_at, end_at, booked_at)"
-                    " VALUES (%s,%s,%s,%s)",
-                    (record["email"], record["start"], record["end"], record["booked_at"]),
+                    "INSERT INTO bookings (email, contact, start_at, end_at, booked_at)"
+                    " VALUES (%s,%s,%s,%s,%s)",
+                    (lookups[0], Json(seal({"email": record["email"]})),
+                     record["start"], record["end"], record["booked_at"]),
                 )
         except psycopg.errors.ExclusionViolation:
             # Somebody else holds that slot. The database decided this, so it
@@ -189,10 +217,17 @@ class PostgresStore:
 
     def erase(self, email: str) -> dict:
         self.ensure_schema()
+        # The plain address goes in the list beside the hashes: rows written
+        # before a key was configured still hold it, and a row erasure cannot
+        # see is a row that does not get erased. Same reasoning as unseal
+        # returning an unwrapped payload as it came.
+        lookups = blind(email) + [(email or "").strip().lower()]
         removed = {}
         with self.pool.connection() as conn:
             for table in ("leads", "bookings"):
-                cur = conn.execute(f"DELETE FROM {table} WHERE lower(email) = %s", (email,))
+                cur = conn.execute(
+                    f"DELETE FROM {table} WHERE lower(email) = ANY(%s)", (lookups,)
+                )
                 removed[table] = cur.rowcount
         return removed
 
