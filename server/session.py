@@ -10,11 +10,15 @@ conversation; only a caller who actually hangs up (or a grace period nobody
 came back for) writes the record and ends the session. That is what the store
 is for, and with REDIS_URL the reconnect survives the worker restarting too.
 
-What Redis does not buy is a second worker. A call still lives on one worker
-for its whole life, and the drop timer is that worker's own. The thing that
-actually blocks a second worker is storage.py's JSON backend: leads and
-bookings behind a threading.Lock, which is process-local. DATABASE_URL is the
-setting that fixes that one.
+A call still lives on one worker for its whole life. What Redis adds is where
+it can be picked back up: a dropped call leaves a hold here - a key carrying
+the worker's token - and whichever worker the reconnect lands on takes it, so
+the timer still sleeping on the first one knows to write nothing. See hold and
+take below, and _finalize_later in main.
+
+The thing that actually blocks a second worker is storage.py's JSON backend:
+leads and bookings behind a threading.Lock, which is process-local.
+DATABASE_URL is the setting that fixes that one.
 """
 from __future__ import annotations
 
@@ -274,13 +278,20 @@ def _evict(items: dict[str, Session], ttl: int, now: float | None = None) -> int
 
 
 class SessionStore:
-    """One process, one dict. The default."""
+    """One process, one dict. The default.
+
+    ``hold`` and ``take`` are the drop-timer claim: whoever takes it back owns
+    the decision to write the call record. With one worker that is always the
+    worker that armed the timer, and this dict is a formality - it earns its
+    keep in RedisSessionStore, where the reconnect can land somewhere else.
+    """
 
     name = "memory"
 
     def __init__(self, ttl: int = SESSION_TTL) -> None:
         self.ttl = ttl
         self._items: dict[str, Session] = {}
+        self._holds: dict[str, str] = {}
 
     async def get(self, session_id: str | None) -> Session:
         """Resume a live session, or mint a new one."""
@@ -297,6 +308,12 @@ class SessionStore:
 
     async def drop(self, session_id: str) -> None:
         self._items.pop(session_id, None)
+
+    async def hold(self, session_id: str, token: str, ttl: float) -> None:
+        self._holds[session_id] = token
+
+    async def take(self, session_id: str) -> str | None:
+        return self._holds.pop(session_id, None)
 
     def sweep(self, now: float | None = None) -> int:
         return _evict(self._items, self.ttl, now)
@@ -326,10 +343,15 @@ class RedisSessionStore:
         # so a Redis that is down cannot stop the process from starting.
         self.redis = redis.asyncio.from_url(url, decode_responses=True)
         self._live: dict[str, Session] = {}
+        self._holds: dict[str, str] = {}
 
     @staticmethod
     def _key(session_id: str) -> str:
         return f"session:{session_id}"
+
+    @staticmethod
+    def _hold_key(session_id: str) -> str:
+        return f"drop:{session_id}"
 
     async def get(self, session_id: str | None) -> Session:
         _evict(self._live, self.ttl)
@@ -373,6 +395,25 @@ class RedisSessionStore:
             await self.redis.delete(self._key(session_id))
         except Exception as exc:  # noqa: BLE001
             log.warning("redis delete failed: %s", exc)
+
+    async def hold(self, session_id: str, token: str, ttl: float) -> None:
+        self._holds[session_id] = token
+        try:
+            # Outlives the grace by a few seconds so the timer that set it is
+            # the one that finds it, not an expiry that beat it by a hair.
+            await self.redis.set(self._hold_key(session_id), token, ex=int(ttl) + 5)
+        except Exception as exc:  # noqa: BLE001 - degrade to one worker, do not die
+            log.warning("redis hold failed; this drop timer is worker-local: %s", exc)
+
+    async def take(self, session_id: str) -> str | None:
+        local = self._holds.pop(session_id, None)
+        try:
+            # GETDEL, not GET then DEL: two workers reaching for the same call
+            # in the same instant must not both come away holding it.
+            return await self.redis.getdel(self._hold_key(session_id))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("redis take failed; falling back to this worker: %s", exc)
+            return local
 
     def __len__(self) -> int:
         return len(self._live)
