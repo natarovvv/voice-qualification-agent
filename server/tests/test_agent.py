@@ -181,6 +181,50 @@ def redis_store(monkeypatch):
     return build
 
 
+async def test_only_one_worker_can_take_a_dropped_call_back(redis_store):
+    """Two workers, one Redis. A reconnect can land on either of them, and the
+    one that takes the hold is the only one allowed to write the record."""
+    armed, elsewhere = redis_store(), redis_store()
+    await armed.hold("S1", "worker-a", 60)
+
+    assert await elsewhere.take("S1") == "worker-a", "the reconnect could not take the call back"
+    assert await armed.take("S1") is None, "the drop timer did not notice it had lost the call"
+
+
+async def test_taking_a_hold_is_one_command(redis_store, monkeypatch):
+    """GETDEL, not GET then DEL.
+
+    Between those two is an await, and against a real server that await is
+    where the other worker reads the same token and comes away holding the
+    same call. fakeredis runs each command straight through, so racing two
+    coroutines here would pass either way - what can be checked is that there
+    is only one command for them to race over. The taker has no local hold of
+    its own, so a DEL that fails cannot be papered over by the fallback.
+    """
+    armed, elsewhere = redis_store(), redis_store()
+    await armed.hold("S4", "worker-a", 60)
+
+    async def refuse(*a, **kw):
+        raise AssertionError("take reached for DEL; the read and the delete are separable")
+
+    monkeypatch.setattr(type(elsewhere.redis), "delete", refuse)
+    assert await elsewhere.take("S4") == "worker-a"
+
+
+async def test_a_hold_survives_the_worker_that_armed_it(redis_store):
+    """The hold is in Redis, not in the process - which is the whole point."""
+    await redis_store().hold("S2", "worker-a", 60)
+    assert await redis_store().take("S2") == "worker-a"
+
+
+async def test_the_memory_store_holds_the_same_way():
+    """One worker takes the same path rather than a special case of it."""
+    store = session_mod.SessionStore()
+    await store.hold("S3", "only-worker", 60)
+    assert await store.take("S3") == "only-worker"
+    assert await store.take("S3") is None, "a hold is taken once or it decides nothing"
+
+
 def test_redis_store_hands_a_session_to_a_second_worker(redis_store):
     """The point of the shared store: another process picks the call back up."""
 
@@ -1469,6 +1513,60 @@ def test_a_reconnect_continues_the_same_call(client):
     spoken = [t["text"] for t in summary["record"]["transcript"]]
     assert any("what does it cost" in t for t in spoken), "the first half was lost"
     assert (session_mod.CALLS_DIR / f"{sid}.json").exists()
+
+
+def test_a_drop_timer_writes_nothing_when_the_call_came_back_on_another_worker(
+    client, monkeypatch
+):
+    """A reconnect on another worker cannot reach this worker's task, so it
+    takes the shared hold instead and this timer finds the call gone.
+
+    Without this the record is written from a copy that stopped growing when
+    the socket died - half a call, over one that is live somewhere else.
+    """
+    monkeypatch.setattr(main_mod, "RESUME_GRACE", 0.3)
+    sid, ws = start_a_call(client)
+    ws.__exit__(None, None, None)
+
+    assert asyncio.run(main_mod.STORE.take(sid)) == main_mod.WORKER, "nothing was holding the call"
+
+    time.sleep(0.6)  # well past the grace this timer is sleeping out
+    assert not (session_mod.CALLS_DIR / f"{sid}.json").exists(), \
+        "wrote half a call over one that had already been picked back up"
+
+
+def test_a_stale_timer_does_not_write_over_a_call_that_dropped_again_elsewhere(
+    client, monkeypatch
+):
+    """The hold is whose it is, not merely whether there is one.
+
+    The caller reconnected on another worker and then dropped again there, so
+    that worker is now holding the call - with the newer copy of it. This
+    timer, still sleeping out a grace that started two drops ago, must leave
+    the record to them.
+    """
+    monkeypatch.setattr(main_mod, "RESUME_GRACE", 0.3)
+    sid, ws = start_a_call(client)
+    ws.__exit__(None, None, None)
+
+    asyncio.run(main_mod.STORE.take(sid))                     # picked up elsewhere
+    asyncio.run(main_mod.STORE.hold(sid, "worker-b", 60))     # and dropped again there
+
+    time.sleep(0.6)
+    assert not (session_mod.CALLS_DIR / f"{sid}.json").exists(),         "wrote a stale copy over the one another worker is holding"
+
+
+def test_a_reconnect_takes_the_hold_so_no_timer_can_claim_the_call(client):
+    """Same worker or not, the reconnect is what takes the call back."""
+    sid, ws = start_a_call(client)
+    ws.__exit__(None, None, None)
+
+    with client.websocket_connect(f"/ws?session_id={sid}") as again:
+        collect(again, "ready")
+        # a drop timer on another worker asking the same question gets nothing
+        assert asyncio.run(main_mod.STORE.take(sid)) is None, "the hold outlived the reconnect"
+        again.send_text(json.dumps({"type": "end"}))
+        collect(again, "summary")
 
 
 def test_an_abandoned_call_is_written_out_when_the_grace_runs_out(client, monkeypatch):

@@ -361,26 +361,37 @@ class Call:
         if clean or RESUME_GRACE <= 0 or not self.session.transcript:
             return await self.finalize()
         await STORE.put(self.session)  # so the reconnect finds the turns so far
+        await STORE.hold(self.session.id, WORKER, RESUME_GRACE)
         _PENDING[self.session.id] = asyncio.create_task(_finalize_later(self))
         log.info("call %s dropped; resumable for %ss", self.session.id, RESUME_GRACE)
         return None
 
 
-# Calls whose socket died, waiting to see whether the caller comes back.
-# ponytail: per-worker, so with several workers a reconnect landing on another
-# one leaves this timer to write the record from a copy that stopped growing.
-# Move the timer into Redis - a key whose TTL is the grace - if that day comes.
+# Calls whose socket died, waiting to see whether the caller comes back. The
+# task is per-worker and only ever releases this worker's resources early; what
+# decides whether a record gets written is the hold in STORE, which every
+# worker can see. With REDIS_URL set, a reconnect landing anywhere takes it.
 _PENDING: dict[str, asyncio.Task] = {}
+
+# Which worker this is. Only ever compared, never parsed - a drop timer asks
+# "is the call still mine" and a token is the whole answer.
+WORKER = secrets.token_hex(8)
 
 
 async def _finalize_later(call: Call) -> None:
     """Write an abandoned call's record once the grace period runs out.
 
-    Cancelled by the reconnect, in which case the call is not over and this
-    never gets past the sleep.
+    Cancelled by a reconnect that lands on this worker, in which case it never
+    gets past the sleep. A reconnect that lands on another one cannot cancel
+    anything here, so the hold is asked instead: this copy of the call stopped
+    growing when the socket died, and writing it over a call that is live again
+    somewhere else would replace the call with half of it.
     """
     await asyncio.sleep(RESUME_GRACE)
     _PENDING.pop(call.session.id, None)
+    if await STORE.take(call.session.id) != WORKER:
+        log.info("call %s came back elsewhere; leaving its record to them", call.session.id)
+        return
     await call.finalize()
 
 
@@ -403,8 +414,14 @@ async def voice_ws(ws: WebSocket) -> None:
     # scheduled in between: the caller is back, so this call is not over after
     # all. If the timer already fired, the pop finds nothing and STORE.get
     # hands back a fresh session, which is the right answer too.
-    if requested and (pending := _PENDING.pop(requested, None)) is not None:
-        pending.cancel()
+    if requested:
+        # Take the hold first, and atomically: a drop timer firing in this same
+        # instant - here or on another worker - has to lose the race and write
+        # nothing. Cancelling the local task only frees this worker's copy
+        # early; the hold is what decides.
+        await STORE.take(requested)
+        if (pending := _PENDING.pop(requested, None)) is not None:
+            pending.cancel()
     session = await STORE.get(requested)
     call = Call(ws, session, app.state.llm)
     await call.send(

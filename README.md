@@ -140,7 +140,8 @@ Client sends raw PCM16 16 kHz mono frames (512 samples), plus
 socket that closes without it leaves the call resumable for `RESUME_GRACE`
 seconds (default 60): reconnect with that `session_id` and the conversation
 continues, history and all, greeted as a call that got cut off rather than a
-new one. If nobody comes back, the record is written when the grace expires.
+new one — and the browser reconnects on its own, so in practice nobody has to.
+If nobody comes back, the record is written when the grace expires.
 
 Server sends PCM16 16 kHz mono frames back, plus JSON:
 
@@ -281,7 +282,12 @@ ids that would escape the calls directory. The Redis store is covered against
 been run against a live `redis-server`. Resume is covered end to end: a socket
 that dies writes no record, a reconnect gets the same session and its first
 half back, an abandoned call is written out when the grace expires, and a
-deliberate hangup is not resumable. The metrics endpoint is covered by a real
+deliberate hangup is not resumable. The hold that makes that safe across
+workers is seven more mutations, all caught: a timer that never asks whether it
+still has the call, one that settles for any hold rather than its own, a
+reconnect that leaves the hold where it is, a drop that arms a timer without
+one, a hold that never reaches Redis, one that stays takeable after it is
+taken, and `GETDEL` split back into `GET` then `DEL`. The metrics endpoint is covered by a real
 call: a spoken turn moves the turn counter, the tool counter and the histogram
 together, and the number the histogram holds is the same one the caller's
 browser was sent. A turn that blows up is counted both as a turn and as a
@@ -437,12 +443,16 @@ Data and third parties, which are decisions rather than settings:
 ## Known corners
 
 - Session memory is a process-local dict unless `REDIS_URL` is set, in which
-  case sessions are shared and expire on Redis's own TTL. Either way it is a
-  call that dropped, not a second worker, that the store is for: a call lives
-  on one worker for its whole life, and the drop timer that eventually writes
-  its record is that worker's own. Sessions the worker is serving stay in a
-  local dict too, so a Redis outage degrades to the single-process behaviour
-  instead of dropping the caller's history mid-sentence.
+  case sessions are shared and expire on Redis's own TTL. A call still lives on
+  one worker for its whole life; what is shared is where it can be picked back
+  up. When a socket dies, the worker puts a *hold* on the call — a key with the
+  worker's own token — and arms a local timer to write the record when the
+  grace expires. Whoever the reconnect lands on takes that hold, atomically,
+  and the timer that finds the hold gone writes nothing: its copy of the call
+  stopped growing when the socket died, and the caller is elsewhere adding to a
+  newer one. Sessions the worker is serving stay in a local dict too, holds
+  included, so a Redis outage degrades to the single-process behaviour instead
+  of dropping the caller's history mid-sentence.
 - A dropped call redials itself. The browser keeps the session id in
   `sessionStorage` and hands it back, and the client reopens the socket on its
   own — half a second later, then one, then two, capped at five, for as long as
