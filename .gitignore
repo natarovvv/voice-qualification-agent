@@ -11,6 +11,10 @@ server/data/bookings.json
 node_modules/
 .next/
 tsconfig.tsbuildinfo
+# next dev writes these two on every run, and rewrites next-env.d.ts to point
+# at .next/dev while next build points at .next - so whichever ran last wins.
+web/AGENTS.md
+web/CLAUDE.md
 
 # Claude Code permission grants: machine-local, not the team's business
 .claude/settings.local.json

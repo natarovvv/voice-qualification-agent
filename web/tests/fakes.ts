@@ -112,7 +112,7 @@ export class FakeWebSocket {
   readonly sent: unknown[] = [];
   onopen: (() => void) | null = null;
   onmessage: ((ev: { data: string | ArrayBuffer }) => void) | null = null;
-  onclose: (() => void) | null = null;
+  onclose: ((ev: { code: number }) => void) | null = null;
   onerror: (() => void) | null = null;
 
   constructor(readonly url: string) {
@@ -123,9 +123,9 @@ export class FakeWebSocket {
     this.sent.push(data);
   }
 
-  close() {
+  close(code = 1000) {
     this.readyState = FakeWebSocket.CLOSED;
-    this.onclose?.();
+    this.onclose?.({ code });
   }
 
   // --- the server's half, driven by the test ---
@@ -140,6 +140,12 @@ export class FakeWebSocket {
 
   audio(pcm: Int16Array) {
     this.onmessage?.({ data: pcm.buffer as ArrayBuffer });
+  }
+
+  /** The socket dying under the call, which is not the same as hanging up.
+   *  1006 is what a browser reports when the connection just went away. */
+  drop(code = 1006) {
+    this.close(code);
   }
 
   /** What the client sent, with the JSON control frames parsed. */

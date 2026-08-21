@@ -10,6 +10,14 @@
 
 export const SAMPLE_RATE = 16000;
 
+// The server holds a dropped call open for RESUME_GRACE - 60 seconds by
+// default - and hands the same session back to whoever asks for its id. So
+// there is a minute in which redialling continues the conversation instead of
+// starting a new one, and this is the client's half of that minute.
+const RECONNECT_WINDOW = 60_000;
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 export type ServerEvent =
   | { type: "ready"; session_id: string; stt: string; tts: string; llm: string }
   | { type: "partial"; text: string }
@@ -24,7 +32,7 @@ export type ServerEvent =
 type Handlers = {
   onEvent: (e: ServerEvent) => void;
   onLevels: (mic: number, agent: number) => void;
-  onState: (s: "idle" | "connecting" | "live" | "closed") => void;
+  onState: (s: "idle" | "connecting" | "live" | "reconnecting" | "closed") => void;
 };
 
 function rms(data: Uint8Array): number {
@@ -48,10 +56,14 @@ export class VoiceClient {
   private playAt = 0;
   private raf = 0;
   private summaryArrived?: () => void;
+  private sessionId?: string;
+  private hangingUp = false;
 
   constructor(private url: string, private h: Handlers) {}
 
   async start(sessionId?: string) {
+    this.hangingUp = false;
+    this.sessionId = sessionId;
     this.h.onState("connecting");
     this.ctx = new AudioContext({ sampleRate: SAMPLE_RATE });
     await this.ctx.audioWorklet.addModule("/capture-worklet.js");
@@ -81,36 +93,95 @@ export class VoiceClient {
     this.outGain.connect(this.outAnalyser);
     this.outGain.connect(this.ctx.destination);
 
-    const qs = new URLSearchParams();
-    if (sessionId) qs.set("session_id", sessionId);
-    // Shipped to the browser, so it is a gate against everyone else's page and
-    // against scanners, not against this page's own user.
-    if (process.env.NEXT_PUBLIC_WS_TOKEN) qs.set("token", process.env.NEXT_PUBLIC_WS_TOKEN);
-    const query = qs.toString();
-    this.ws = new WebSocket(`${this.url}/ws${query ? `?${query}` : ""}`);
-    this.ws.binaryType = "arraybuffer";
+    // Not awaited: the first dial reports itself through onState the way it
+    // always did, and a call that never opened has no session to go back for.
+    this.connect().catch(() => {});
+  }
 
-    this.ws.onopen = () => {
-      this.h.onState("live");
-      if (this.node) {
-        this.node.port.onmessage = (ev) => {
-          if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(ev.data as Int16Array);
-        };
+  /**
+   * Open the socket and wire it up. Resolves once it is open, rejects with the
+   * close event if it never got there - which is what lets redial tell "still
+   * down, try again" apart from "the server does not want this call".
+   */
+  private connect(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const qs = new URLSearchParams();
+      if (this.sessionId) qs.set("session_id", this.sessionId);
+      // Shipped to the browser, so it is a gate against everyone else's page and
+      // against scanners, not against this page's own user.
+      if (process.env.NEXT_PUBLIC_WS_TOKEN) qs.set("token", process.env.NEXT_PUBLIC_WS_TOKEN);
+      const query = qs.toString();
+      const ws = new WebSocket(`${this.url}/ws${query ? `?${query}` : ""}`);
+      ws.binaryType = "arraybuffer";
+      this.ws = ws;
+      let opened = false;
+
+      ws.onopen = () => {
+        opened = true;
+        this.h.onState("live");
+        if (this.node) {
+          this.node.port.onmessage = (ev) => {
+            if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(ev.data as Int16Array);
+          };
+        }
+        this.meter();
+        resolve();
+      };
+      ws.onmessage = (ev) => {
+        if (typeof ev.data === "string") {
+          const msg = JSON.parse(ev.data) as ServerEvent;
+          // Whatever the server calls this call is what a redial asks for. On
+          // a first connection that is a new id; after a grace period that
+          // expired it is a different one, and asking for the old one again
+          // would only get the same answer a second time.
+          if (msg.type === "ready") this.sessionId = msg.session_id;
+          if (msg.type === "interrupt") this.stopPlayback();
+          if (msg.type === "summary") this.summaryArrived?.();
+          this.h.onEvent(msg);
+        } else {
+          this.enqueue(new Int16Array(ev.data as ArrayBuffer));
+        }
+      };
+      ws.onclose = (ev) => {
+        if (!opened) return reject(ev);
+        // 1008 is the server saying do not come back: a bad token, or a caller
+        // who blew the audio rate limit. Anything else is a call that dropped,
+        // and redial is where it is decided whether to go back for it.
+        if (ev.code === 1008) return this.h.onState("closed");
+        void this.redial();
+      };
+      ws.onerror = () => this.h.onEvent({ type: "error", message: "websocket error" });
+    });
+  }
+
+  /**
+   * Redial the call that just dropped.
+   *
+   * Only the socket died: the microphone, the AudioContext and the worklet are
+   * all still alive, so this reopens the socket and nothing else - the caller
+   * is never asked for the microphone twice and the audio graph does not
+   * flicker. A dropped connection is not a hangup, and on a phone it is the
+   * ordinary case rather than the exception.
+   */
+  private async redial() {
+    const deadline = Date.now() + RECONNECT_WINDOW;
+    for (let attempt = 0; Date.now() < deadline; attempt++) {
+      // Twice, for two different races: stop() sets the flag before it closes
+      // the socket, so the close it causes arrives here with it already set -
+      // and a caller who gives up while this is between attempts sets it
+      // during the sleep.
+      if (this.hangingUp) return;
+      this.h.onState("reconnecting");
+      await sleep(Math.min(500 * 2 ** attempt, 5000));
+      if (this.hangingUp) return;
+      try {
+        await this.connect();
+        return;
+      } catch (ev) {
+        if ((ev as CloseEvent).code === 1008) break; // the server means it
       }
-      this.meter();
-    };
-    this.ws.onmessage = (ev) => {
-      if (typeof ev.data === "string") {
-        const msg = JSON.parse(ev.data) as ServerEvent;
-        if (msg.type === "interrupt") this.stopPlayback();
-        if (msg.type === "summary") this.summaryArrived?.();
-        this.h.onEvent(msg);
-      } else {
-        this.enqueue(new Int16Array(ev.data as ArrayBuffer));
-      }
-    };
-    this.ws.onclose = () => this.h.onState("closed");
-    this.ws.onerror = () => this.h.onEvent({ type: "error", message: "websocket error" });
+    }
+    this.h.onState("closed");
   }
 
   /** Type a turn instead of speaking it - same server pipeline. */
@@ -152,6 +223,7 @@ export class VoiceClient {
   }
 
   private meter() {
+    cancelAnimationFrame(this.raf); // a redial must not leave two loops running
     const micData = new Uint8Array(this.micAnalyser?.frequencyBinCount ?? 0);
     const outData = new Uint8Array(this.outAnalyser!.frequencyBinCount);
     const tick = () => {
@@ -164,18 +236,23 @@ export class VoiceClient {
   }
 
   async stop() {
+    this.hangingUp = true;     // before anything closes: redial checks this
     this.h.onState("closed");  // the wait for the record below is seconds long
     cancelAnimationFrame(this.raf);
     this.stopPlayback();
-    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: "end" }));
     this.mic?.getTracks().forEach((t) => t.stop());
     this.node?.disconnect();
-    // wait for the call record, don't guess at how long the summary takes:
-    // it is an LLM round trip and runs several seconds behind the hangup
-    await new Promise<void>((resolve) => {
-      this.summaryArrived = resolve;
-      setTimeout(resolve, 15000);
-    });
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: "end" }));
+      // wait for the call record, don't guess at how long the summary takes:
+      // it is an LLM round trip and runs several seconds behind the hangup.
+      // Only worth waiting on a socket that is open - hanging up in the middle
+      // of a redial has nothing to wait for, and 15 seconds of it is a hang.
+      await new Promise<void>((resolve) => {
+        this.summaryArrived = resolve;
+        setTimeout(resolve, 15000);
+      });
+    }
     this.ws?.close();
     await this.ctx?.close();
     this.h.onState("idle");

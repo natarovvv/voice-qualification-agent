@@ -55,10 +55,11 @@ still work, which is how you test on a box with no microphone. **End call**
 waits for the call record, so it takes a few seconds — that is an LLM round
 trip writing the summary.
 
-If the connection drops instead of ending — wifi blinks, the tab reloads —
-press **Start call** again. The tab remembers the session id, and the agent
-picks the same conversation back up rather than greeting you from scratch.
-That window is `RESUME_GRACE`, 60 seconds by default.
+If the connection drops instead of ending — wifi blinks, a tunnel dies — the
+page redials on its own and the agent picks the same conversation back up
+rather than greeting you from scratch. Reload the tab and **Start call** does
+the same thing by hand, because the session id is in `sessionStorage` either
+way. That window is `RESUME_GRACE`, 60 seconds by default.
 
 ### Keys (all optional)
 
@@ -287,7 +288,7 @@ browser was sent. A turn that blows up is counted both as a turn and as a
 failure, and a call turned away for capacity is counted as rejected and *not*
 as served, so a busy box cannot flatter its own latency by dropping traffic.
 
-The browser half is 21 Vitest tests over jsdom. They cover what the client
+The browser half is 33 Vitest tests over jsdom. They cover what the client
 tells the browser to do rather than what it renders: chunks of the agent's
 voice scheduled back to back behind one 60 ms jitter buffer and never into the
 past, PCM16 decoded without clipping the negative rail, a barge-in dropping
@@ -296,8 +297,15 @@ audio nobody will hear, the mic frames stopping at a closed socket, a denied
 microphone still leaving a usable call, and the session id being kept across a
 drop and forgotten on a real hangup. The capture worklet is tested through a
 `postMessage` that genuinely detaches the transferred buffer, because that is
-what turns a missing `.slice()` into silence. Every one of these was checked by
-breaking the code it covers: all thirteen mutations fail the suite. The
+what turns a missing `.slice()` into silence. Redialling is twelve more
+mutations on top, all caught: a drop that just ends the call, a hangup that
+gets redialled anyway, 1008 retried like any other close, a redial asking for
+the id Start asked for instead of the one the server minted, a second meter
+loop left running, a backoff that never backs off and one that never stops
+doubling — the ceiling is what keeps a late recovery inside the window — and
+the page offering Start while the client is already redialling. Every one of
+these was checked by breaking the code it covers: all thirteen of the original
+mutations fail the suite too. The
 metrics went through the same treatment - eleven mutations, all caught,
 including the one that matters most quietly: `bisect_right` for `bisect_left`,
 which moves a turn landing exactly on the 1200 ms budget from inside it to
@@ -435,10 +443,15 @@ Data and third parties, which are decisions rather than settings:
   its record is that worker's own. Sessions the worker is serving stay in a
   local dict too, so a Redis outage degrades to the single-process behaviour
   instead of dropping the caller's history mid-sentence.
-- Reconnecting is manual. The browser keeps the session id in `sessionStorage`
-  and hands it back on the next Start, so a dropped call continues where it
-  stopped — but nothing redials on its own. Auto-reconnect is worth adding
-  when a caller is expected to be on a phone rather than at a desk.
+- A dropped call redials itself. The browser keeps the session id in
+  `sessionStorage` and hands it back, and the client reopens the socket on its
+  own — half a second later, then one, then two, capped at five, for as long as
+  the server still holds the call. Only the socket is rebuilt: the microphone,
+  the AudioContext and the worklet stay up, so nobody is asked for permission
+  twice. It gives up after `RESUME_GRACE`, because past that the record is
+  written and there is nothing left to rejoin. Two things stop it early: the
+  caller pressing End, and close code 1008 — a bad token, or an audio rate
+  limit, neither of which a reconnect improves.
 - Leads and bookings live in Postgres when `DATABASE_URL` is set and in JSON
   files when it is not. The files are written temp-file-then-rename so a crash
   cannot truncate one, but their `threading.Lock` is process-local and does
@@ -475,8 +488,5 @@ Data and third parties, which are decisions rather than settings:
   `llama-3.3-70b-versatile` were both retired during this build; the current
   defaults are `gemini-3.1-flash-lite` and `openai/gpt-oss-120b`. A 404 from a
   provider means the name moved again, not that the code broke.
-- A provider that fails mid-turn costs the caller that turn ("Sorry, I lost
-  that for a second"); there is no runtime failover between Groq and Gemini,
-  only the choice made at startup.
 - On Windows the `&` in this folder's name breaks `npx`; use
   `node ./node_modules/next/dist/bin/next dev` or rename the folder.
