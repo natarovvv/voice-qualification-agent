@@ -1140,6 +1140,17 @@ def new_key() -> str:
     return Fernet.generate_key().decode()
 
 
+def use_keys(monkeypatch, *keys: str) -> None:
+    """Turn encryption on for one test - the cipher and the blind index both.
+
+    In production these are one setting: config reads CALL_ENCRYPTION_KEY once
+    and both come off that list. A test that moved only one of them would be
+    describing a deployment that cannot exist.
+    """
+    monkeypatch.setattr(session_mod, "CIPHER", cipher_for(*keys) if keys else None)
+    monkeypatch.setattr(session_mod, "CALL_ENCRYPTION_KEYS", list(keys))
+
+
 @pytest.fixture
 def sealed(monkeypatch, tmp_path):
     """Records encrypted for the length of one test, under a key of its own.
@@ -1149,7 +1160,7 @@ def sealed(monkeypatch, tmp_path):
     precisely what encryption is for, and precisely why the key and the data
     have to travel together.
     """
-    monkeypatch.setattr(session_mod, "CIPHER", cipher_for(new_key()))
+    use_keys(monkeypatch, new_key())
     monkeypatch.setattr(storage, "DATA_DIR", tmp_path)
 
 
@@ -1613,3 +1624,107 @@ def test_the_tools_run_against_postgres(pg_store, monkeypatch):
 
     erased = tools.erase_caller("cfo@bigco.com")
     assert erased["removed"]["leads"] == 1 and erased["removed"]["bookings"] == 1
+
+
+def lead_for(email: str) -> dict:
+    return {
+        "email": email, "domain": email.split("@")[1], "company_size": 600,
+        "score": 80, "tier": "hot", "reasons": ["business email domain", "500+ employees"],
+        "qualified": True, "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def everything_in(store) -> str:
+    """Every column of every row, as text. to_jsonb(t) takes the whole row, so
+    a column added later is searched too without anyone remembering to."""
+    with store.pool.connection() as conn:
+        rows = conn.execute(
+            "SELECT to_jsonb(leads) FROM leads UNION ALL SELECT to_jsonb(bookings) FROM bookings"
+        ).fetchall()
+    return str(rows)
+
+
+def test_postgres_keeps_no_address_in_the_clear(pg_store, monkeypatch):
+    use_keys(monkeypatch, new_key())
+    pg_store.add_lead(lead_for("cto@acme.io"))
+    assert pg_store.book(booking("cto@acme.io", slot(days_ahead=6)), 30, 3) is None
+
+    dump = everything_in(pg_store)
+    assert "cto@acme.io" not in dump
+    assert "acme.io" not in dump, "the domain is the address with the name cut off, not something else"
+
+    with pg_store.pool.connection() as conn:
+        contact = conn.execute("SELECT contact FROM leads").fetchone()[0]
+    assert session_mod.unseal(contact) == {"email": "cto@acme.io", "domain": "acme.io"}, \
+        "sealed has to mean recoverable; a hash alone would have thrown the lead away"
+
+
+def test_postgres_erases_a_caller_it_cannot_read(pg_store, monkeypatch):
+    """Equality is all the hash owes erasure, and it is enough."""
+    use_keys(monkeypatch, new_key())
+    pg_store.add_lead(lead_for("cto@acme.io"))
+    assert pg_store.book(booking("cto@acme.io", slot(days_ahead=7)), 30, 3) is None
+    assert pg_store.erase("CTO@Acme.io") == {"leads": 1, "bookings": 1}
+
+
+def test_a_rotated_key_still_erases_yesterdays_rows(pg_store, monkeypatch):
+    old, new = new_key(), new_key()
+    use_keys(monkeypatch, old)
+    pg_store.add_lead(lead_for("cto@acme.io"))
+    use_keys(monkeypatch, new, old)  # new first: from here it both seals and hashes
+    pg_store.add_lead(lead_for("cto@acme.io"))
+    assert pg_store.erase("cto@acme.io")["leads"] == 2, "the older key is still in the lookup"
+
+
+def test_a_row_written_before_the_key_is_still_erasable(pg_store, monkeypatch):
+    pg_store.add_lead(lead_for("cto@acme.io"))  # no key yet: the address is its own lookup
+    use_keys(monkeypatch, new_key())
+    pg_store.add_lead(lead_for("cto@acme.io"))
+    assert pg_store.erase("cto@acme.io")["leads"] == 2, "turning the key on is not a migration"
+
+
+def test_the_cap_and_the_overlap_still_hold_when_sealed(pg_store, monkeypatch):
+    """Both of the reasons this table is not a file, with the address hidden."""
+    use_keys(monkeypatch, new_key())
+    start = slot(days_ahead=8)
+    for i in range(3):
+        assert pg_store.book(booking("greedy@acme.io", start + timedelta(minutes=30 * i)), 30, 3) is None
+    assert pg_store.book(
+        booking("greedy@acme.io", start + timedelta(minutes=90)), 30, 3
+    ) == "too_many_bookings", "the cap counts rows it cannot read"
+    assert pg_store.book(
+        booking("other@acme.io", start + timedelta(minutes=15)), 30, 3
+    ) == "slot_taken", "the constraint never saw an address in the first place"
+
+
+def test_a_table_from_before_the_seal_takes_new_rows_and_still_erases(pg_uri, monkeypatch):
+    """The ALTER lines in SCHEMA, against the schema they exist for.
+
+    The old table had domain NOT NULL and no contact at all, so an insert from
+    the sealed code would fail outright if the migration were a no-op. The old
+    row keeps its address in the clear - nothing rewrites a row the way a rows
+    file gets rewritten - and erasure still has to reach it.
+    """
+    import storage as storage_mod
+
+    store = storage_mod.PostgresStore(url=pg_uri)
+    store.pool.open()
+    with store.pool.connection() as conn:
+        conn.execute("DROP TABLE IF EXISTS leads, bookings")
+        conn.execute(
+            "CREATE TABLE leads (id bigserial PRIMARY KEY, email text NOT NULL,"
+            " domain text NOT NULL, company_size integer NOT NULL, score integer NOT NULL,"
+            " tier text NOT NULL, reasons jsonb NOT NULL DEFAULT '[]'::jsonb,"
+            " qualified boolean NOT NULL, checked_at timestamptz NOT NULL DEFAULT now())"
+        )
+        conn.execute(
+            "INSERT INTO leads (email, domain, company_size, score, tier, qualified)"
+            " VALUES ('old@acme.io', 'acme.io', 10, 30, 'cold', false)"
+        )
+    store.ensure_schema()
+
+    use_keys(monkeypatch, new_key())
+    store.add_lead(lead_for("new@acme.io"))
+    assert store.erase("old@acme.io")["leads"] == 1, "the row that predates the key is still reachable"
+    assert store.erase("new@acme.io")["leads"] == 1
+    store.pool.close()

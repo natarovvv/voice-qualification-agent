@@ -28,7 +28,7 @@ browser mic ─ AudioWorklet ─► PCM16 16k ─ websocket ─► VAD ─► ST
 | [server/tools.py](server/tools.py) | The three tools + JSON schemas |
 | [server/session.py](server/session.py) | TTL session memory, sanitizing, sealed call records |
 | [server/metrics.py](server/metrics.py) | Prometheus counters and the latency histogram |
-| [server/storage.py](server/storage.py) | Leads and bookings: sealed JSON files or Postgres |
+| [server/storage.py](server/storage.py) | Leads and bookings, sealed either way: JSON files or Postgres |
 | [web/](web/) | Next.js 16 UI: meters, transcript, tool log, latency |
 | [web/lib/voice.ts](web/lib/voice.ts) | Mic capture, jitter buffer, barge-in, session resume |
 
@@ -70,7 +70,7 @@ Copy `.env.example` to `.env` in the repo root:
 | both LLM keys | with only one, a provider outage is a failed turn rather than a slower one |
 | `GEMINI_API_KEY` | — |
 | `DEEPGRAM_API_KEY` | STT falls back to local faster-whisper, then to none; the voice falls back to edge-tts |
-| `CALL_ENCRYPTION_KEY` | records, leads and bookings are written to disk in the clear, as before |
+| `CALL_ENCRYPTION_KEY` | records, leads and bookings are stored in the clear, as before — files and Postgres both |
 | `REDIS_URL` | sessions live in a process-local dict instead of a shared store |
 | `DATABASE_URL` | leads and bookings stay JSON files, which one process may write |
 
@@ -318,6 +318,16 @@ under a key we do not have is refused rather than read as empty and overwritten.
 Postgres is covered against a real
 PostgreSQL booted from the `pgserver` wheel, including six independent stores
 racing for one slot; with the constraint dropped that test sells it six times.
+Sealing it adds six tests and nine more mutations, all caught: that neither
+the address nor its domain appears in any column of any row — `to_jsonb(t)`
+takes the whole row, so a column added later is searched without anyone
+remembering to — that the sealed `contact` still gives the address back, that
+erasure finds a caller it cannot read and finds one written under a retired
+key, that a row written before the key existed is still erasable, and that the
+cap counts rows it cannot read while the overlap constraint, which never saw
+an address in the first place, still holds. The last one builds the old table
+by hand — `domain NOT NULL`, no `contact` — and checks that a sealed insert
+lands in it and that the plaintext row already there is still erasable.
 
 ## Security
 
@@ -371,11 +381,26 @@ Data and third parties, which are decisions rather than settings:
   key, stops the process from starting. Writing plaintext you believe is
   encrypted is worse than not starting.
 
-  **What this does not cover: Postgres.** With `DATABASE_URL` set, leads and
-  bookings are plaintext columns — the email is indexed and the booking
-  overlap is an `EXCLUDE USING gist` constraint, and neither works on
-  ciphertext. That is the database's own at-rest encryption to provide, or the
-  volume's. The key covers what this server writes to files.
+  **Postgres is sealed by the same key.** The address is no longer a column:
+  the row carries an HMAC of it under those same keys, and the address itself
+  sits sealed beside it in `contact`. Equality is all the lookups ever needed —
+  the booking cap and erasure are both `WHERE email = ANY(...)` — so the index
+  still works, and rotation works the way sealing does, because a write goes
+  under the first key while a lookup goes out under all of them. The `domain`
+  column is gone: it was `email.split("@")[1]`, which made it a second copy of
+  the same personal datum sitting in the clear.
+
+  Booking times stay legible, because `EXCLUDE USING gist` is the entire reason
+  that table is not a file and a range index cannot read ciphertext. An empty
+  slot is not personal data; who is in it is, and that part is sealed.
+
+  **What this does not cover: rows already in Postgres.** A file re-seals
+  itself because it is rewritten whole; a row is not, so anything written
+  before the key was set stays in the clear until something rewrites it.
+  Erasure still reaches those rows — the plain address goes into the lookup
+  beside the hashes — but re-sealing them is an `UPDATE` this repo does not
+  ship. Turning the key on is still not a migration; it is just not a
+  retrofit either.
 
   `CALL_RETENTION_DAYS` (default 30) deletes records at startup whether sealed
   or not, and the erasure endpoint below handles a named caller.
