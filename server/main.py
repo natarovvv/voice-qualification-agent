@@ -31,6 +31,7 @@ from config import (
     ALLOWED_ORIGINS,
     AUTH_TOKEN,
     BYTES_PER_SEC,
+    DATABASE_URL,
     ECHO_TAIL,
     HOST,
     MAX_CALLS,
@@ -38,9 +39,11 @@ from config import (
     MAX_TURN_CHARS,
     PORT,
     RATE_LIMIT_FACTOR,
+    REDIS_URL,
     RESUME_GRACE,
     SYSTEM_PROMPT,
     TEXT_WINDOW,
+    WORKERS,
 )
 from session import STORE, purge_old_calls, sanitize
 from stt import make_stt
@@ -506,6 +509,18 @@ async def voice_ws(ws: WebSocket) -> None:
 if __name__ == "__main__":
     import uvicorn
 
+    if WORKERS > 1 and not (REDIS_URL and DATABASE_URL):
+        # Refused rather than warned. The failure is a caller told a slot is
+        # theirs when it is somebody else's, which nobody reads a log to find
+        # out about, and the two settings that fix it are one line each.
+        raise SystemExit(
+            f"WORKERS={WORKERS} needs REDIS_URL and DATABASE_URL. Without them each "
+            "worker keeps its own sessions and its own booking lock, so a dropped "
+            "call cannot come back and the same slot gets sold twice."
+        )
     # Loopback and no auto-reload by default: reload watches the tree and forks
     # a child, which is a development convenience, not a thing to expose.
-    uvicorn.run("main:app", host=HOST, port=PORT, reload=bool(os.getenv("DEV")))
+    uvicorn.run(
+        "main:app", host=HOST, port=PORT, reload=bool(os.getenv("DEV")),
+        workers=WORKERS if WORKERS > 1 else None,
+    )

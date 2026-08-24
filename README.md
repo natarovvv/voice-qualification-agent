@@ -32,6 +32,7 @@ browser mic ─ AudioWorklet ─► PCM16 16k ─ websocket ─► VAD ─► ST
 | [server/reseal.py](server/reseal.py) | One-shot: re-seal rows that predate the key, or the key before last |
 | [web/](web/) | Next.js 16 UI: meters, transcript, tool log, latency |
 | [web/lib/voice.ts](web/lib/voice.ts) | Mic capture, jitter buffer, barge-in, session resume |
+| [docker-compose.yml](docker-compose.yml) | The four containers: Postgres, Redis, server, page |
 
 ## Run it
 
@@ -129,6 +130,50 @@ still cuts in.
 The room decides the numbers, so they are env knobs: `ECHO_THRESHOLD` (0.5
 disables the duck, which is what you want on a headset), `ECHO_START_MS`,
 `ECHO_TAIL_MS`.
+
+## Deploy
+
+```bash
+docker compose up --build
+```
+
+Then http://localhost:3000. Four containers — PostgreSQL for leads and
+bookings, Redis for sessions, the server, the page — which is the first time
+the multi-worker claim further down has anything under it. The root `.env` is
+read if it is there and skipped if it is not, so this comes up with no keys at
+all, offline LLM and edge-tts, exactly the way it does on a laptop.
+
+`WORKERS` is 2 here *because* both of those stores are wired, which is the
+whole condition. `python main.py` refuses to start with more than one worker
+unless `REDIS_URL` and `DATABASE_URL` are both set — refuses rather than warns,
+because the failure is a caller being told a slot is theirs when it is somebody
+else's, and nobody reads the log of a server that came up.
+
+Two things are decided at build time rather than run time:
+
+- `NEXT_PUBLIC_WS_URL` and `NEXT_PUBLIC_WS_TOKEN` are compiled into the browser
+  bundle — the browser never sees the container's environment — so they are
+  build args, and changing either one means rebuilding the web image. The
+  token argument reads `AUTH_TOKEN`, because a call is refused when the two
+  disagree and one secret with two names should come from one place.
+- The server image installs `requirements.lock` with the test tools filtered
+  out. `pgserver` alone is a whole PostgreSQL, and there is a real one next
+  door.
+
+`server/data` is a named volume, so call records survive `docker compose down`
+and `kb.json` is seeded into it from the image on the first run. Postgres keeps
+its own. `docker compose down -v` is the one that throws both away.
+
+One-off work runs in the container like anywhere else:
+
+```bash
+docker compose exec server python reseal.py --dry-run
+```
+
+Before this is reachable by anything but your own laptop: set `AUTH_TOKEN` in
+`.env` — the server says so at startup, every time, until you do — terminate
+TLS in front of it, and point `NEXT_PUBLIC_WS_URL` at the `wss://` address.
+See Security.
 
 ## Wire protocol
 
@@ -263,7 +308,10 @@ cd web && npm test
 
 Every push and pull request runs them on GitHub Actions
 ([.github/workflows/ci.yml](.github/workflows/ci.yml)), along with `next build`
-for the web app. CI installs `requirements.lock` rather than
+for the web app and a third job that brings the whole compose stack up and asks
+both ports for an answer — a deploy is the part of a repo that rots without
+anyone noticing, because nothing else here would fail if the Dockerfile stopped
+building. CI installs `requirements.lock` rather than
 `requirements.txt`: the lock is the core path, and the extras would pull torch
 and CUDA wheels for two fallbacks the tests stub out anyway. No keys are
 configured there and none are needed — the live tests skip themselves and
