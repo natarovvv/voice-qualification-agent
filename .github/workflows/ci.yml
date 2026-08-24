@@ -13,6 +13,18 @@ on:
 jobs:
   server:
     runs-on: ubuntu-latest
+    # The drop-timer hold is a race between workers, and fakeredis cannot lose
+    # a race - it runs every command straight through. This one can.
+    services:
+      redis:
+        image: redis:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6

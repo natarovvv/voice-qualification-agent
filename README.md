@@ -287,7 +287,26 @@ workers is seven more mutations, all caught: a timer that never asks whether it
 still has the call, one that settles for any hold rather than its own, a
 reconnect that leaves the hold where it is, a drop that arms a timer without
 one, a hold that never reaches Redis, one that stays takeable after it is
-taken, and `GETDEL` split back into `GET` then `DEL`. The metrics endpoint is covered by a real
+taken, and `GETDEL` split back into `GET` then `DEL`.
+
+That last one needs a real server. fakeredis runs every command straight
+through, so two workers reaching for the same key cannot lose that race there
+however the code is written — the mutation survives, which is the fake
+agreeing with the bug. Against a real `redis-server`, ten workers reach for
+one dropped call at once and `GET` then `DEL` hands it to **all ten**. They
+have to be ten warm connections: on a cold one each `take` spends its first
+await on the TCP handshake and they queue up politely instead of racing, which
+is its own small lesson about what a passing concurrency test is worth.
+
+The claim underneath all of it — that a call surviving its worker is what
+makes a second worker safe — is a test that starts two of the real servers on
+two ports against one Redis. The call opens on A and its socket dies; the
+caller comes back on B, which has never heard of the call; A's drop timer
+wakes, finds the call taken and writes nothing; and the record that eventually
+gets written has both halves of the conversation in it. Delete the check in
+`_finalize_later` and that test fails with worker A's half-call on disk.
+
+The metrics endpoint is covered by a real
 call: a spoken turn moves the turn counter, the tool counter and the histogram
 together, and the number the histogram holds is the same one the caller's
 browser was sent. A turn that blows up is counted both as a turn and as a
