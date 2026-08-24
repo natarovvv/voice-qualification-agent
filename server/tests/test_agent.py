@@ -11,6 +11,7 @@ import math
 import os
 import pathlib
 import secrets
+import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -189,26 +190,6 @@ async def test_only_one_worker_can_take_a_dropped_call_back(redis_store):
 
     assert await elsewhere.take("S1") == "worker-a", "the reconnect could not take the call back"
     assert await armed.take("S1") is None, "the drop timer did not notice it had lost the call"
-
-
-async def test_taking_a_hold_is_one_command(redis_store, monkeypatch):
-    """GETDEL, not GET then DEL.
-
-    Between those two is an await, and against a real server that await is
-    where the other worker reads the same token and comes away holding the
-    same call. fakeredis runs each command straight through, so racing two
-    coroutines here would pass either way - what can be checked is that there
-    is only one command for them to race over. The taker has no local hold of
-    its own, so a DEL that fails cannot be papered over by the fallback.
-    """
-    armed, elsewhere = redis_store(), redis_store()
-    await armed.hold("S4", "worker-a", 60)
-
-    async def refuse(*a, **kw):
-        raise AssertionError("take reached for DEL; the read and the delete are separable")
-
-    monkeypatch.setattr(type(elsewhere.redis), "delete", refuse)
-    assert await elsewhere.take("S4") == "worker-a"
 
 
 async def test_a_hold_survives_the_worker_that_armed_it(redis_store):
@@ -1861,3 +1842,148 @@ def test_a_table_from_before_the_seal_takes_new_rows_and_still_erases(pg_uri, mo
     assert store.erase("old@acme.io")["leads"] == 1, "the row that predates the key is still reachable"
     assert store.erase("new@acme.io")["leads"] == 1
     store.pool.close()
+
+
+# --------------------------------------------------- a real redis-server
+
+
+REDIS_TEST_URL = os.getenv("REDIS_TEST_URL", "redis://127.0.0.1:6379")
+WORKER_SCRIPT = pathlib.Path(__file__).resolve().parent / "mute_worker.py"
+
+
+@pytest.fixture(scope="session")
+def real_redis():
+    """A redis-server that is actually a redis-server.
+
+    fakeredis has the command semantics but not the concurrency: it runs every
+    command straight through, so two workers reaching for the same key cannot
+    lose that race there however the code is written. Start one with
+    `docker run --rm -p 6379:6379 redis:8-alpine`; CI brings its own.
+    """
+    redis = pytest.importorskip("redis")
+    client = redis.Redis.from_url(REDIS_TEST_URL, decode_responses=True, socket_connect_timeout=1)
+    try:
+        client.ping()
+    except Exception as exc:  # noqa: BLE001 - any failure to reach it is a skip
+        pytest.skip(f"no redis-server at {REDIS_TEST_URL}: {type(exc).__name__}")
+    client.flushdb()
+    yield REDIS_TEST_URL
+    client.flushdb()
+    client.close()
+
+
+async def test_a_hold_crosses_processes_through_a_real_redis(real_redis):
+    """Two stores, two connections, one server - which is what two workers are
+    once the fake is out of the way."""
+    armed = session_mod.RedisSessionStore(url=real_redis)
+    elsewhere = session_mod.RedisSessionStore(url=real_redis)
+    try:
+        await armed.hold("real-1", "worker-a", 60)
+        assert await elsewhere.take("real-1") == "worker-a", "the reconnect could not take it back"
+        assert await armed.take("real-1") is None, "the drop timer still thinks it has the call"
+    finally:
+        await armed.redis.aclose()
+        await elsewhere.redis.aclose()
+
+
+async def test_only_one_of_many_workers_takes_the_call_back(real_redis):
+    """The race fakeredis cannot lose.
+
+    Ten workers reach for the same dropped call at once. GET and then DEL
+    hands the same token to every one of them that reads before the first
+    delete lands, and each of those believes it is the one that may write the
+    record. GETDEL is one command, so exactly one hand comes away full.
+    """
+    workers = [session_mod.RedisSessionStore(url=real_redis) for _ in range(10)]
+    try:
+        # Open every connection first. A worker that has been serving calls has
+        # an open pool; without this each take spends its first await on the TCP
+        # handshake, and ten coroutines queue up politely instead of racing.
+        await asyncio.gather(*(w.redis.ping() for w in workers))
+        await workers[0].hold("real-2", "worker-a", 60)
+        got = await asyncio.gather(*(w.take("real-2") for w in workers))
+        assert got.count("worker-a") == 1, f"the call was taken back {got.count('worker-a')} times"
+    finally:
+        for w in workers:
+            await w.redis.aclose()
+
+
+def _worker(port: int, redis_url: str, grace: float, log: pathlib.Path):
+    """The shipped server in its own process, sharing this test's DATA_DIR."""
+    env = {**os.environ, "REDIS_URL": redis_url, "RESUME_GRACE": str(grace), "PORT": str(port)}
+    handle = log.open("w", encoding="utf-8")
+    proc = subprocess.Popen(
+        [sys.executable, str(WORKER_SCRIPT), str(port)],
+        env=env, stdout=handle, stderr=subprocess.STDOUT,
+    )
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            raise AssertionError(f"worker on {port} died:\n{log.read_text(encoding='utf-8')}")
+        try:
+            if httpx.get(f"http://127.0.0.1:{port}/health", timeout=1).status_code == 200:
+                return proc
+        except httpx.HTTPError:
+            time.sleep(0.3)
+    proc.terminate()
+    raise AssertionError(f"worker on {port} never answered:\n{log.read_text(encoding='utf-8')}")
+
+
+async def _until(ws, want: str, limit: int = 80) -> dict:
+    for _ in range(limit):
+        raw = await asyncio.wait_for(ws.recv(), timeout=20)
+        if isinstance(raw, bytes):
+            continue
+        msg = json.loads(raw)
+        if msg.get("type") == want:
+            return msg
+    raise AssertionError(f"never saw {want}")
+
+
+async def test_a_reconnect_on_another_worker_leaves_no_stale_record(real_redis, tmp_path):
+    """The claim this repo makes about running more than one worker.
+
+    The call starts on A and its socket dies, so A arms a drop timer. The
+    caller comes back on B, which has never heard of the call and cannot reach
+    anything of A's except the hold they share. A's timer then has to wake up,
+    find the call taken, and write nothing - because its copy stopped growing
+    when the socket died, and B is still adding to a newer one.
+    """
+    websockets = pytest.importorskip("websockets")
+
+    grace = 6.0
+    a_log, b_log = tmp_path / "worker-a.log", tmp_path / "worker-b.log"
+    workers = [_worker(8111, real_redis, grace, a_log), _worker(8112, real_redis, grace, b_log)]
+    try:
+        async with websockets.connect("ws://127.0.0.1:8111/ws") as a:
+            sid = (await _until(a, "ready"))["session_id"]
+            await a.send(json.dumps({"type": "text", "text": "what does it cost"}))
+            await _until(a, "final")
+        # no {"type":"end"}: the socket just went, and worker A is now holding
+        # the call open for six seconds
+
+        async with websockets.connect(f"ws://127.0.0.1:8112/ws?session_id={sid}") as b:
+            ready = await _until(b, "ready")
+            assert ready["session_id"] == sid, "worker B did not find the call worker A had"
+            hello = await _until(b, "assistant")
+            assert hello["text"] == main_mod.RESUME_GREETING, "greeted as a new call"
+
+            await asyncio.sleep(grace + 3)  # worker A's timer has been and gone
+            assert not (session_mod.CALLS_DIR / f"{sid}.json").exists(), (
+                "worker A wrote its half of the call while worker B was still on it:\n"
+                + a_log.read_text(encoding="utf-8")
+            )
+
+            await b.send(json.dumps({"type": "text", "text": "that is all, thanks"}))
+            await _until(b, "final")
+            await b.send(json.dumps({"type": "end"}))
+            summary = await _until(b, "summary")
+
+        spoken = [t["text"] for t in summary["record"]["transcript"]]
+        assert any("what does it cost" in t for t in spoken), "worker A's half was lost"
+        assert any("that is all" in t for t in spoken), "worker B's half was lost"
+        assert (session_mod.CALLS_DIR / f"{sid}.json").exists(), "the hangup wrote no record"
+    finally:
+        for proc in workers:
+            proc.terminate()
+            proc.wait(timeout=20)
