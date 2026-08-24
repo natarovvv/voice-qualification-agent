@@ -1590,6 +1590,180 @@ def test_resume_can_be_turned_off(client, monkeypatch):
     assert sid not in main_mod._PENDING
 
 
+# --------------------------------------------- shutting the worker down
+
+def app_client(monkeypatch):
+    """The client fixture, but this test owns when it stops.
+
+    Which is the whole subject here: what the app does on the way out is not
+    something a fixture can hold open across the assertion.
+    """
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(main_mod, "make_stt", lambda: FakeSTT())
+    monkeypatch.setattr(main_mod.tts, "make_tts", lambda: FakeTTS())
+    return TestClient(main_mod.app)
+
+
+def test_a_shutdown_writes_the_call_it_was_holding(monkeypatch):
+    """A deploy is not a hangup, but it is the end of this worker.
+
+    The record of a dropped call lives in a timer sleeping out the grace, and
+    that timer stops existing when the process does - so before this, every
+    `docker compose up` on a running system silently threw away every call
+    waiting for its caller to come back. The grace is a promise this worker
+    cannot keep once it is going away, and an unwritten record is worse than a
+    caller who cannot resume.
+    """
+    monkeypatch.setattr(main_mod, "RESUME_GRACE", 300)  # nobody waits that out
+
+    async def slow_summary(*_args, **_kwargs):
+        # A record costs an LLM round trip to write, so a shutdown that only
+        # tells the timers to hurry up and then exits still loses them.
+        await asyncio.sleep(0.3)
+        return {"intent": "pricing"}
+
+    monkeypatch.setattr(main_mod.llm_mod, "summarize", slow_summary)
+    with app_client(monkeypatch) as c:
+        sid, ws = start_a_call(c)
+        ws.__exit__(None, None, None)
+        path = session_mod.CALLS_DIR / f"{sid}.json"
+        assert not path.exists(), "written while the caller could still come back"
+
+    assert path.exists(), "the shutdown took the record with it"
+    assert "what does it cost" in path.read_text(encoding="utf-8"), "the record is not the call"
+
+
+def test_a_shutdown_leaves_a_call_that_came_back_elsewhere_alone(monkeypatch):
+    """The hold decides on the way out too.
+
+    Being shut down is not a reason to write over a call that is live on
+    another worker: this copy stopped growing when the socket died.
+    """
+    monkeypatch.setattr(main_mod, "RESUME_GRACE", 300)
+    with app_client(monkeypatch) as c:
+        sid, ws = start_a_call(c)
+        ws.__exit__(None, None, None)
+        asyncio.run(main_mod.STORE.take(sid))  # a reconnect, on some other worker
+
+    assert not (session_mod.CALLS_DIR / f"{sid}.json").exists(),         "wrote half a call over one that had been picked back up"
+
+
+def test_a_shutdown_with_nothing_in_flight_is_quiet(monkeypatch):
+    """The ordinary case: the timers list is empty and nothing waits on it."""
+    with app_client(monkeypatch) as c:
+        with c.websocket_connect("/ws") as ws:
+            ready, _ = collect(ws, "ready")
+            ws.send_text(json.dumps({"type": "text", "text": "what does it cost"}))
+            collect(ws, "final")
+            ws.send_text(json.dumps({"type": "end"}))
+            collect(ws, "summary")
+    assert (session_mod.CALLS_DIR / f"{ready['session_id']}.json").exists()
+    assert not main_mod._PENDING
+
+
+# ------------------------------------------------------------- retention
+
+
+@pytest.fixture
+def rows(monkeypatch, tmp_path):
+    """A JSON store with a directory of its own."""
+    monkeypatch.setattr(storage, "DATA_DIR", tmp_path)
+    return storage.JsonStore()
+
+
+def days_ago(days: float) -> str:
+    return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+
+def test_retention_reaches_leads_and_bookings(rows):
+    """The window was a promise about call records only, and it was written
+    down as a promise about everything. Leads and bookings are the same
+    personal data with the transcript taken out."""
+    rows.add_lead({**lead_for("old@acme.io"), "checked_at": days_ago(40)})
+    rows.add_lead(lead_for("fresh@acme.io"))
+    assert rows.purge(30) == {"leads": 1, "bookings": 0}
+    assert [r["email"] for r in rows._load("leads")] == ["fresh@acme.io"]
+
+
+def test_retention_keeps_a_booking_that_has_not_happened_yet(rows):
+    """A booking ages from the meeting, not from the booking.
+
+    Counting from booked_at would delete an appointment made five weeks ahead
+    of time on the morning it was due - and free the slot underneath it.
+    """
+    soon = slot(days_ahead=3)
+    rows.book({"email": "patient@acme.io", "start": soon.isoformat(),
+               "end": (soon + timedelta(minutes=30)).isoformat(),
+               "booked_at": days_ago(40)}, 30, 3)
+    over = datetime.now(timezone.utc) - timedelta(days=40)
+    rows.book({"email": "done@acme.io", "start": over.isoformat(),
+               "end": (over + timedelta(minutes=30)).isoformat(),
+               "booked_at": days_ago(41)}, 30, 3)
+
+    assert rows.purge(30) == {"leads": 0, "bookings": 1}
+    assert [r["email"] for r in rows._load("bookings")] == ["patient@acme.io"]
+
+
+def test_retention_keeps_a_row_it_cannot_date(rows):
+    """Deleting what it cannot read is the one mistake retention cannot undo."""
+    rows.add_lead({**lead_for("odd@acme.io"), "checked_at": "sometime last tuesday"})
+    assert rows.purge(30) == {"leads": 0, "bookings": 0}
+
+
+def test_retention_off_keeps_everything(rows):
+    rows.add_lead({**lead_for("old@acme.io"), "checked_at": days_ago(4000)})
+    assert rows.purge(0) == {}
+    assert len(rows._load("leads")) == 1
+
+
+def test_retention_comes_back_around_without_a_restart(monkeypatch):
+    """The half that made the rest of it theatre.
+
+    This ran at startup and nowhere else, so a container that stays up for a
+    month never enforced the window once - and the deploy is what made staying
+    up for a month the normal case. Both of these are made *after* the app has
+    started, so only a pass that comes back around can find them.
+    """
+    monkeypatch.setattr(main_mod, "RETENTION_EVERY", 0.05)
+    with app_client(monkeypatch):
+        stale = session_mod.CALLS_DIR / "stale-by-a-year.json"
+        stale.write_text("{}", encoding="utf-8")
+        year = time.time() - 365 * 86400
+        os.utime(stale, (year, year))
+        storage.STORAGE.add_lead({**lead_for("ancient@acme.io"), "checked_at": days_ago(400)})
+
+        def gone():
+            return "ancient@acme.io" not in [r.get("email") for r in storage.STORAGE._load("leads")]
+
+        deadline = time.monotonic() + 10
+        while not gone() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert gone(), "a pass that comes back around never reached the rows"
+        assert not stale.exists(), "the window is only enforced by restarting"
+
+
+async def test_a_failed_retention_pass_does_not_end_the_loop(monkeypatch, caplog):
+    """One unreachable database must not be the last pass this worker runs."""
+    monkeypatch.setattr(main_mod, "RETENTION_EVERY", 0.05)
+    calls = []
+
+    async def sometimes():
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("database went away")
+
+    monkeypatch.setattr(main_mod, "_enforce_retention", sometimes)
+    task = asyncio.create_task(main_mod._retention_loop())
+    try:
+        for _ in range(100):
+            if len(calls) > 2:
+                break
+            await asyncio.sleep(0.05)
+        assert len(calls) > 2, "the loop stopped at the first failure"
+    finally:
+        task.cancel()
+
 # ------------------------------------------------------------------- postgres
 
 
@@ -2067,6 +2241,34 @@ def test_workers_starting_together_do_not_fight_over_the_schema(pg_uri):
         w.pool.close()
 
     assert not failures, f"a worker could not start: {failures}"
+
+
+
+def test_postgres_retention_reaches_rows_too(pg_store):
+    """The window means the same thing whichever backend is holding the rows.
+
+    Nothing here ever expired anything: leads and bookings in Postgres were
+    kept until somebody named the caller and asked for an erasure.
+    """
+    pg_store.add_lead({**lead_for("old@acme.io"), "checked_at": days_ago(40)})
+    pg_store.add_lead(lead_for("fresh@acme.io"))
+
+    over = datetime.now(timezone.utc) - timedelta(days=40)
+    assert pg_store.book({"email": "done@acme.io", "start": over.isoformat(),
+                          "end": (over + timedelta(minutes=30)).isoformat(),
+                          "booked_at": days_ago(41)}, 30, 3) is None
+    ahead = slot(days_ahead=13)
+    assert pg_store.book({"email": "patient@acme.io", "start": ahead.isoformat(),
+                          "end": (ahead + timedelta(minutes=30)).isoformat(),
+                          "booked_at": days_ago(40)}, 30, 3) is None
+
+    assert pg_store.purge(30) == {"leads": 1, "bookings": 1}
+    with pg_store.pool.connection() as conn:
+        assert conn.execute("SELECT count(*) FROM leads").fetchone()[0] == 1
+        # booked forty days ago for next week, and still an appointment
+        assert conn.execute("SELECT count(*) FROM bookings").fetchone()[0] == 1
+
+    assert pg_store.purge(0) == {}, "0 is keep forever, not delete everything"
 
 
 def test_more_than_one_worker_needs_the_shared_stores():

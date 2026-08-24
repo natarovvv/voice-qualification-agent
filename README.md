@@ -160,6 +160,15 @@ Two things are decided at build time rather than run time:
   out. `pgserver` alone is a whole PostgreSQL, and there is a real one next
   door.
 
+A redeploy does not take the calls in flight with it. When the process is
+told to stop, every dropped call still inside its resume window is written out
+there and then: the timer holding it is about to stop existing, and a record
+nobody writes is worse than a caller who cannot resume. A caller who came back
+on another worker still wins that race, because the hold is what decides.
+`SHUTDOWN_GRACE` (10 s) bounds both halves — how long uvicorn waits for open
+sockets, and how long the records get after that — and compose gives the
+container 30 s before the kill, which is both halves and room.
+
 `server/data` is a named volume, so call records survive `docker compose down`
 and `kb.json` is seeded into it from the image on the first run. Postgres keeps
 its own. `docker compose down -v` is the one that throws both away.
@@ -331,7 +340,12 @@ ids that would escape the calls directory. The Redis store is covered against
 been run against a live `redis-server`. Resume is covered end to end: a socket
 that dies writes no record, a reconnect gets the same session and its first
 half back, an abandoned call is written out when the grace expires, and a
-deliberate hangup is not resumable. The hold that makes that safe across
+deliberate hangup is not resumable. A shutdown writes what it was still
+holding, which is three tests and four mutations: a shutdown that never wakes
+the timers, one that wakes them and exits without waiting — a record costs an
+LLM round trip, so that one really does lose it — a woken timer that writes
+without asking whose the call is, and a timer that sleeps its grace out and
+ignores the shutdown entirely. The hold that makes that safe across
 workers is seven more mutations, all caught: a timer that never asks whether it
 still has the call, one that settles for any hold rather than its own, a
 reconnect that leaves the hold where it is, a drop that arms a timer without
@@ -396,6 +410,16 @@ more: that a lead is not in the file, that a plain rows file re-seals itself on
 the next write without losing the rows already in it, that the booking overlap
 still holds through the seal, and — the one that would hurt — that a rows file
 under a key we do not have is refused rather than read as empty and overwritten.
+
+Retention is seven tests and seven mutations, all caught: a window enforced at
+startup and never again, a failed pass that ends the loop, a pass that does the
+files and forgets the rows, a booking aged from when it was booked rather than
+from when the meeting ended — on both backends, because they are two pieces of
+code making the same choice — a row with an unreadable date deleted rather than
+kept, and `CALL_RETENTION_DAYS=0` reading as *delete everything* rather than
+*keep forever*. The one that proves the clock is a real one makes its stale
+record and its stale lead **after** the app has started, so only a pass that
+comes back around can find them.
 
 Postgres is covered against a real
 PostgreSQL booted from the `pgserver` wheel, including six independent stores
@@ -525,8 +549,17 @@ Data and third parties, which are decisions rather than settings:
   old key from the list. A row still on the retired key is one nothing can
   find the day that key goes away.
 
-  `CALL_RETENTION_DAYS` (default 30) deletes records at startup whether sealed
-  or not, and the erasure endpoint below handles a named caller.
+  `CALL_RETENTION_DAYS` (default 30) is enforced at startup and then every
+  `RETENTION_EVERY` seconds (an hour by default), because a container that
+  stays up for a month would otherwise never enforce it once. It covers
+  everything this server keeps, not only the transcripts: call records sealed
+  or not, and leads and bookings on both backends. A lead ages from when it was
+  scored; a booking ages from when the meeting *ended* rather than from when it
+  was made, so an appointment booked five weeks ahead is not deleted on the
+  morning it is due, taking its slot with it. A row whose date cannot be read
+  is kept — deleting what it cannot understand is the one mistake retention
+  does not get to take back. The erasure endpoint below handles a named
+  caller.
 - Audio goes to Deepgram, text goes to Groq or Gemini. With `DEEPGRAM_API_KEY`
   set, the voice is Deepgram Aura — the same vendor and contract as the
   transcriber, so one DPA covers both directions. Without the key it falls back

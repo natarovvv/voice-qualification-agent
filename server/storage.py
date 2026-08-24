@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from config import DATABASE_URL, DATA_DIR
@@ -36,6 +36,13 @@ from session import Unreadable, blind, seal, unseal, write_json
 log = logging.getLogger(__name__)
 
 MAX_RECORDS = 5000  # json backend only; the file is read whole on every call
+
+# What the retention window counts from, by the file backend's field names.
+# A lead ages from when it was scored. A booking ages from when the meeting
+# ended rather than from when it was made: a slot booked five weeks out is
+# still an appointment somebody means to keep, and expiring the record would
+# free the slot underneath them.
+AGES_FROM = {"leads": "checked_at", "bookings": "end"}
 
 # The key every worker waits on before touching the schema. Any bigint would
 # do; this one is the word, so a pg_locks row naming it says who is holding it.
@@ -89,6 +96,18 @@ ALTER TABLE bookings ADD COLUMN IF NOT EXISTS contact jsonb;
 """
 
 
+def _older_than(stamp: Any, cutoff: datetime) -> bool:
+    """A row with no readable date is a row that stays.
+
+    Deleting what cannot be understood is the one mistake retention cannot
+    take back, and every field here is written by this server in one format.
+    """
+    try:
+        return datetime.fromisoformat(stamp) < cutoff
+    except (TypeError, ValueError):
+        return False
+
+
 class JsonStore:
     """A file per collection. No setup, one process, and it says so."""
 
@@ -139,6 +158,21 @@ class JsonStore:
             rows.append(record)
             self._save("bookings", rows)
         return None
+
+    def purge(self, days: int) -> dict:
+        """Drop rows past the retention window. Same promise as call records."""
+        if days <= 0:
+            return {}
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        removed = {}
+        with self._lock:
+            for name, field in AGES_FROM.items():
+                rows = self._load(name)
+                kept = [r for r in rows if not _older_than(r.get(field), cutoff)]
+                removed[name] = len(rows) - len(kept)
+                if removed[name]:
+                    self._save(name, kept)
+        return removed
 
     def erase(self, email: str) -> dict:
         removed = {}
@@ -236,6 +270,22 @@ class PostgresStore:
                 log.warning("booking deadlocked; asking again (%s/3)", attempt + 1)
                 if attempt == 2:
                     raise  # three of these in a row is not contention any more
+
+    def purge(self, days: int) -> dict:
+        if days <= 0:
+            return {}
+        self.ensure_schema()
+        removed = {}
+        with self.pool.connection() as conn:
+            # end_at rather than booked_at, for the reason at AGES_FROM; the
+            # column names differ from the file backend's but the choice does not.
+            for table, field in (("leads", "checked_at"), ("bookings", "end_at")):
+                cur = conn.execute(
+                    f"DELETE FROM {table} WHERE {field} < now() - make_interval(days => %s)",
+                    (days,),
+                )
+                removed[table] = cur.rowcount
+        return removed
 
     def erase(self, email: str) -> dict:
         self.ensure_schema()
