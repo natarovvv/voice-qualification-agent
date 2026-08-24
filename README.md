@@ -352,6 +352,13 @@ under a key we do not have is refused rather than read as empty and overwritten.
 Postgres is covered against a real
 PostgreSQL booted from the `pgserver` wheel, including six independent stores
 racing for one slot; with the constraint dropped that test sells it six times.
+Six was also enough for PostgreSQL to deadlock the racers against each other
+while they checked that constraint — it settles a tie by killing one — so a
+booking that deadlocks now asks again instead of handing the caller a
+traceback where the word `slot_taken` belongs. It wrote nothing and the winner
+has committed by the time it comes back, which makes the second answer the
+ordinary one. Two tests: a deadlock that clears on the retry, and one that
+never clears and is eventually allowed to fail.
 Sealing it adds six tests and nine more mutations, all caught: that neither
 the address nor its domain appears in any column of any row — `to_jsonb(t)`
 takes the whole row, so a column added later is searched without anyone

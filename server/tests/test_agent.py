@@ -1723,6 +1723,47 @@ def test_two_workers_cannot_sell_the_same_slot(pg_store, pg_uri):
         assert conn.execute("SELECT count(*) FROM bookings").fetchone()[0] == 1
 
 
+
+def test_a_deadlocked_booking_asks_again(pg_store, monkeypatch):
+    """A deadlock is not a refusal.
+
+    Six racers found this one in CI: postgres shot five of them while they
+    were checking the exclusion constraint against each other, and five
+    callers got a traceback where the answer was supposed to be the word
+    slot_taken. The loser wrote nothing, so coming back once is all it takes -
+    by then the winner has committed and the question has an ordinary answer.
+
+    The deadlock is injected rather than raced, because a race that only
+    sometimes reaches the code it is covering is not covering it.
+    """
+    import psycopg
+
+    real = pg_store.pool.connection
+    attempts = []
+
+    def deadlock_once(*args, **kwargs):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise psycopg.errors.DeadlockDetected("deadlock detected")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(pg_store.pool, "connection", deadlock_once)
+    assert pg_store.book(booking("a@acme.io", slot(days_ahead=11)), 30, 3) is None
+    assert len(attempts) == 2, "it gave up on a question it never got an answer to"
+
+
+def test_a_booking_that_only_ever_deadlocks_gives_up(pg_store, monkeypatch):
+    """Retrying forever would hold the caller on a line nobody is coming to."""
+    import psycopg
+
+    def always(*args, **kwargs):
+        raise psycopg.errors.DeadlockDetected("deadlock detected")
+
+    monkeypatch.setattr(pg_store.pool, "connection", always)
+    with pytest.raises(psycopg.errors.DeadlockDetected):
+        pg_store.book(booking("a@acme.io", slot(days_ahead=12)), 30, 3)
+
+
 def test_the_tools_run_against_postgres(pg_store, monkeypatch):
     """The tools themselves, not just the store underneath them."""
     monkeypatch.setattr(tools, "STORAGE", pg_store)
