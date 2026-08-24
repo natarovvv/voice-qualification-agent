@@ -29,6 +29,7 @@ browser mic ─ AudioWorklet ─► PCM16 16k ─ websocket ─► VAD ─► ST
 | [server/session.py](server/session.py) | TTL session memory, sanitizing, sealed call records |
 | [server/metrics.py](server/metrics.py) | Prometheus counters and the latency histogram |
 | [server/storage.py](server/storage.py) | Leads and bookings, sealed either way: JSON files or Postgres |
+| [server/reseal.py](server/reseal.py) | One-shot: re-seal rows that predate the key, or the key before last |
 | [web/](web/) | Next.js 16 UI: meters, transcript, tool log, latency |
 | [web/lib/voice.ts](web/lib/voice.ts) | Mic capture, jitter buffer, barge-in, session resume |
 
@@ -362,6 +363,15 @@ an address in the first place, still holds. The last one builds the old table
 by hand — `domain NOT NULL`, no `contact` — and checks that a sealed insert
 lands in it and that the plaintext row already there is still erasable.
 
+The retrofit that catches those rows up is seven tests and seven mutations,
+all caught: a lookup written under the last key instead of the first, a sealed
+`contact` never read back so the hash gets hashed again, a row it cannot open
+rewritten anyway, `--dry-run` writing, a row already current rewritten, a
+retrofitted lead losing the domain that has to be rebuilt off its address, and
+the script running with no key configured. The one that proves it is a real
+rotation: seal under one key, re-seal under the next, then take the first key
+away entirely and erase the row by address — which only works if the row moved.
+
 ## Security
 
 The defaults assume a laptop: the server binds `127.0.0.1` and auto-reload is
@@ -427,13 +437,38 @@ Data and third parties, which are decisions rather than settings:
   that table is not a file and a range index cannot read ciphertext. An empty
   slot is not personal data; who is in it is, and that part is sealed.
 
-  **What this does not cover: rows already in Postgres.** A file re-seals
-  itself because it is rewritten whole; a row is not, so anything written
-  before the key was set stays in the clear until something rewrites it.
-  Erasure still reaches those rows — the plain address goes into the lookup
-  beside the hashes — but re-sealing them is an `UPDATE` this repo does not
-  ship. Turning the key on is still not a migration; it is just not a
-  retrofit either.
+  **Rows already in Postgres are a retrofit.** A file re-seals itself because
+  it is rewritten whole; a row is not. A lead written before the key was set
+  keeps its address in a column, and one written under a key that has since
+  been rotated out keeps that key's hash. Neither is broken — a lookup goes
+  out under every configured key with the plain address beside them, which is
+  why erasure reaches both, and why turning the key on is not a migration. It
+  is also why *the key is on* and *the data is sealed* stay two different
+  sentences until [server/reseal.py](server/reseal.py) has been run once:
+
+  ```bash
+  cd server && python reseal.py --dry-run
+  ```
+
+  ```bash
+  cd server && python reseal.py
+  ```
+
+  It rewrites each row's lookup under the current first key and re-seals the
+  address beside it, and skips whatever is already there, so a second run is a
+  no-op. Two things it will not do. It refuses to run with no key configured,
+  because `seal` is a no-op then and it would copy every address into
+  `contact` in the clear and report success. And a row sealed under a key this
+  deployment no longer has is counted and left exactly as it is, rather than
+  rewritten: the address is *inside* the part that cannot be opened, so a
+  rewrite would seal the hash of a hash and lose the lead for good. That count
+  is the exit code — nonzero means the run came up short, the same answer the
+  erasure endpoint gives for the same reason.
+
+  The rotation this matters for is the last step of one, not the first: rotate
+  by putting the new key in front of the old, run this, and only then drop the
+  old key from the list. A row still on the retired key is one nothing can
+  find the day that key goes away.
 
   `CALL_RETENTION_DAYS` (default 30) deletes records at startup whether sealed
   or not, and the erasure endpoint below handles a named caller.

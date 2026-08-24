@@ -1844,6 +1844,148 @@ def test_a_table_from_before_the_seal_takes_new_rows_and_still_erases(pg_uri, mo
     store.pool.close()
 
 
+# ------------------------------------------------ re-sealing rows already there
+
+
+def resealer():
+    import reseal
+
+    return reseal
+
+
+def test_reseal_retrofits_rows_written_before_the_key(pg_store, monkeypatch):
+    """The retrofit the key alone is not.
+
+    These two rows were written by a deployment with no key at all, so the
+    address is sitting in a column. Turning the key on does not touch them -
+    nothing rewrites a row the way a rows file gets rewritten - and this is the
+    UPDATE that does.
+    """
+    pg_store.add_lead(lead_for("cto@acme.io"))
+    assert pg_store.book(booking("cto@acme.io", slot(days_ahead=9)), 30, 3) is None
+    assert "cto@acme.io" in everything_in(pg_store), "the setup is not what this test thinks"
+
+    use_keys(monkeypatch, new_key())
+    counts = resealer().reseal(pg_store)
+    assert counts["leads"]["resealed"] == 1 and counts["bookings"]["resealed"] == 1
+
+    dump = everything_in(pg_store)
+    assert "cto@acme.io" not in dump
+    assert "acme.io" not in dump, "the domain came back as a substring of the address"
+    with pg_store.pool.connection() as conn:
+        contact = conn.execute("SELECT contact FROM leads").fetchone()[0]
+    assert session_mod.unseal(contact) == {"email": "cto@acme.io", "domain": "acme.io"}, \
+        "a row that cannot be read back is a lead thrown away, not a lead sealed"
+    assert pg_store.erase("cto@acme.io") == {"leads": 1, "bookings": 1}, \
+        "the new lookup does not match what the row was rewritten with"
+
+
+def test_reseal_moves_a_row_onto_the_current_key(pg_store, monkeypatch):
+    """A rotation, and then the old key actually going away.
+
+    Rotation needs no migration because a lookup goes out under every key that
+    is still configured. That stops being true the day the retired key is
+    dropped from the list, and this is what has to happen first.
+    """
+    old, new = new_key(), new_key()
+    use_keys(monkeypatch, old)
+    pg_store.add_lead(lead_for("cto@acme.io"))
+
+    use_keys(monkeypatch, new, old)  # new first: it seals and hashes from here
+    assert resealer().reseal(pg_store)["leads"]["resealed"] == 1
+
+    use_keys(monkeypatch, new)  # the old key is gone for good
+    assert pg_store.erase("cto@acme.io")["leads"] == 1, "the row was left on the retired key"
+
+
+def test_reseal_leaves_a_row_that_is_already_current(pg_store, monkeypatch):
+    """Run it twice, because somebody will."""
+    use_keys(monkeypatch, new_key())
+    pg_store.add_lead(lead_for("cto@acme.io"))  # written sealed in the first place
+
+    first = resealer().reseal(pg_store)["leads"]
+    assert first == {"resealed": 0, "already": 1, "unreadable": 0}
+
+    pg_store.add_lead(lead_for("cfo@acme.io"))
+    assert resealer().reseal(pg_store)["leads"]["resealed"] == 0, \
+        "a row the running server sealed is not one this has to touch"
+
+
+def test_a_dry_run_changes_nothing(pg_store, monkeypatch):
+    pg_store.add_lead(lead_for("cto@acme.io"))
+    use_keys(monkeypatch, new_key())
+
+    assert resealer().reseal(pg_store, dry_run=True)["leads"]["resealed"] == 1
+    assert "cto@acme.io" in everything_in(pg_store), "--dry-run wrote"
+    assert resealer().reseal(pg_store)["leads"]["resealed"] == 1, "and it did not consume the row"
+
+
+def test_reseal_counts_a_row_it_cannot_open(pg_store, monkeypatch):
+    """The same answer erasure gives: say the count is short, do not pretend.
+
+    Overwriting the row instead would be worse than leaving it - the address
+    is only inside the part that cannot be opened, so a rewrite would seal the
+    hash of a hash and lose the lead for good.
+    """
+    lost = new_key()
+    use_keys(monkeypatch, lost)
+    pg_store.add_lead(lead_for("cto@acme.io"))
+    before = everything_in(pg_store)
+
+    use_keys(monkeypatch, new_key())
+    assert resealer().reseal(pg_store)["leads"] == {"resealed": 0, "already": 0, "unreadable": 1}
+    assert everything_in(pg_store) == before, "a row it could not read was rewritten anyway"
+
+    use_keys(monkeypatch, lost)  # the key turns up again
+    assert resealer().reseal(pg_store)["leads"]["already"] == 1
+
+
+
+def test_reseal_retrofits_a_row_from_the_table_before_contact(pg_uri, monkeypatch):
+    """The rows with nowhere to have put a sealed address in the first place.
+
+    An older deployment of this repo had `domain` as a column and no `contact`
+    at all, so ADD COLUMN left those rows with a NULL one. The address is in
+    the email column, the domain has to be rebuilt from it, and both have to
+    end up looking like a row this server would write today.
+    """
+    import storage as storage_mod
+
+    store = storage_mod.PostgresStore(url=pg_uri)
+    store.pool.open()
+    with store.pool.connection() as conn:
+        conn.execute("DROP TABLE IF EXISTS leads, bookings")
+        conn.execute(
+            "CREATE TABLE leads (id bigserial PRIMARY KEY, email text NOT NULL,"
+            " domain text NOT NULL, company_size integer NOT NULL, score integer NOT NULL,"
+            " tier text NOT NULL, reasons jsonb NOT NULL DEFAULT '[]'::jsonb,"
+            " qualified boolean NOT NULL, checked_at timestamptz NOT NULL DEFAULT now())"
+        )
+        conn.execute(
+            "INSERT INTO leads (email, domain, company_size, score, tier, qualified)"
+            " VALUES ('old@acme.io', 'acme.io', 10, 30, 'cold', false)"
+        )
+    store.ensure_schema()  # adds contact, drops domain; the row keeps its address
+
+    use_keys(monkeypatch, new_key())
+    import reseal
+
+    assert reseal.reseal(store)["leads"]["resealed"] == 1
+    with store.pool.connection() as conn:
+        contact = conn.execute("SELECT contact FROM leads").fetchone()[0]
+    assert session_mod.unseal(contact) == {"email": "old@acme.io", "domain": "acme.io"},         "the domain column is gone, so it has to come back off the address"
+    assert "old@acme.io" not in everything_in(store)
+    assert store.erase("old@acme.io")["leads"] == 1
+    store.pool.close()
+
+
+def test_reseal_refuses_to_run_without_a_key(pg_store, monkeypatch):
+    """Without a key seal() is a no-op, so this would copy every address into
+    contact in the clear and call it done."""
+    use_keys(monkeypatch)
+    with pytest.raises(SystemExit):
+        resealer().reseal(pg_store)
+
 # --------------------------------------------------- a real redis-server
 
 
