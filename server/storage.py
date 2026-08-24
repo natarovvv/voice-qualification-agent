@@ -192,28 +192,39 @@ class PostgresStore:
 
         self.ensure_schema()
         lookups = blind(record["email"])
-        try:
-            with self.pool.connection() as conn, conn.transaction():
-                # ponytail: read-committed, so two simultaneous bookings can
-                # both pass the cap and land at cap+1. It is a spam guard, not
-                # money; the overlap below is the invariant that has to hold,
-                # and that one the constraint enforces whatever happens here.
-                taken = conn.execute(
-                    "SELECT count(*) FROM bookings WHERE email = ANY(%s)", (lookups,)
-                ).fetchone()[0]
-                if taken >= cap:
-                    return "too_many_bookings"
-                conn.execute(
-                    "INSERT INTO bookings (email, contact, start_at, end_at, booked_at)"
-                    " VALUES (%s,%s,%s,%s,%s)",
-                    (lookups[0], Json(seal({"email": record["email"]})),
-                     record["start"], record["end"], record["booked_at"]),
-                )
-        except psycopg.errors.ExclusionViolation:
-            # Somebody else holds that slot. The database decided this, so it
-            # is true even when the deciding worker is not this one.
-            return "slot_taken"
-        return None
+        # Asking again is part of asking. Two overlapping inserts landing
+        # together can each end up waiting on the other's constraint check,
+        # and postgres breaks the tie by killing one of them - so the loser
+        # has not been refused, it has not been answered. Nothing of its own
+        # was written, and by the time it comes back the winner has committed,
+        # which turns the question into the ordinary one.
+        for attempt in range(3):
+            try:
+                with self.pool.connection() as conn, conn.transaction():
+                    # ponytail: read-committed, so two simultaneous bookings can
+                    # both pass the cap and land at cap+1. It is a spam guard, not
+                    # money; the overlap below is the invariant that has to hold,
+                    # and that one the constraint enforces whatever happens here.
+                    taken = conn.execute(
+                        "SELECT count(*) FROM bookings WHERE email = ANY(%s)", (lookups,)
+                    ).fetchone()[0]
+                    if taken >= cap:
+                        return "too_many_bookings"
+                    conn.execute(
+                        "INSERT INTO bookings (email, contact, start_at, end_at, booked_at)"
+                        " VALUES (%s,%s,%s,%s,%s)",
+                        (lookups[0], Json(seal({"email": record["email"]})),
+                         record["start"], record["end"], record["booked_at"]),
+                    )
+                return None
+            except psycopg.errors.ExclusionViolation:
+                # Somebody else holds that slot. The database decided this, so it
+                # is true even when the deciding worker is not this one.
+                return "slot_taken"
+            except psycopg.errors.DeadlockDetected:
+                log.warning("booking deadlocked; asking again (%s/3)", attempt + 1)
+                if attempt == 2:
+                    raise  # three of these in a row is not contention any more
 
     def erase(self, email: str) -> dict:
         self.ensure_schema()
