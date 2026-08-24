@@ -49,6 +49,9 @@ services:
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000}
       # Two, because both stores above are set, which is the whole condition.
       WORKERS: ${WORKERS:-2}
+    # SIGTERM, and then every call still in flight has a record to write
+    # before the kill lands. SHUTDOWN_GRACE is the server's half of this.
+    stop_grace_period: 30s
     ports:
       - "${SERVER_PORT:-8000}:8000"
     volumes:

@@ -38,9 +38,12 @@ from config import (
     MAX_TEXT_TURNS,
     MAX_TURN_CHARS,
     PORT,
+    CALL_RETENTION_DAYS,
     RATE_LIMIT_FACTOR,
     REDIS_URL,
     RESUME_GRACE,
+    RETENTION_EVERY,
+    SHUTDOWN_GRACE,
     SYSTEM_PROMPT,
     TEXT_WINDOW,
     WORKERS,
@@ -74,14 +77,69 @@ async def lifespan(app: FastAPI):
             await asyncio.to_thread(storage.STORAGE.ensure_schema)
         except Exception:  # noqa: BLE001
             log.exception("could not reach the database; tool calls will report it")
-    log.info("retention: purged %s expired call records", purge_old_calls())
+    # Made here rather than at import, because an Event belongs to the loop
+    # that first waits on it and this app gets brought up in more than one -
+    # by the tests, and by anything that restarts it in-process. Every drop
+    # timer sleeps against this one, so a shutdown wakes them all at once
+    # instead of taking their records with it.
+    app.state.shutting_down = asyncio.Event()
+    await _enforce_retention()
+    app.state.retention = (
+        asyncio.create_task(_retention_loop()) if CALL_RETENTION_DAYS > 0 else None
+    )
     if not AUTH_TOKEN and HOST not in ("127.0.0.1", "localhost", "::1"):
         log.warning(
             "SERVING %s WITHOUT AUTH_TOKEN: anyone who can reach this port can "
             "spend your STT and LLM budget", HOST
         )
     yield
+    # Every call this worker is holding open for a comeback has its record in a
+    # timer that is about to stop existing. So the timers are told to stop
+    # waiting, and each one writes exactly as it would have at the end of the
+    # grace - hold and all, so a caller who came back on another worker still
+    # wins that race. The grace was a promise this process cannot keep now, and
+    # a record nobody writes is worse than a caller who cannot resume.
+    app.state.shutting_down.set()
+    if app.state.retention:
+        app.state.retention.cancel()
+    if _PENDING:
+        log.info("shutdown: %s dropped calls still had a record to write", len(_PENDING))
+        # ponytail: a summary that hangs still takes its own record down with
+        # it, exactly as it does mid-call. Bounded so it cannot take the
+        # shutdown with it as well.
+        with suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                asyncio.gather(*list(_PENDING.values()), return_exceptions=True),
+                SHUTDOWN_GRACE,
+            )
     await app.state.http.aclose()
+
+
+async def _enforce_retention() -> None:
+    """The retention window, for everything this server keeps.
+
+    Call records are files and leads and bookings are rows or files depending
+    on DATABASE_URL, and the window is one promise over all of them - it was
+    never only about the transcripts.
+    """
+    gone = await asyncio.to_thread(purge_old_calls)
+    rows = await asyncio.to_thread(storage.STORAGE.purge, CALL_RETENTION_DAYS)
+    if gone or any(rows.values()):
+        log.info("retention: purged %s call records, %s", gone, rows)
+
+
+async def _retention_loop() -> None:
+    """Enforce it again, on a server that is not going to be restarted.
+
+    This used to run at startup and nowhere else, which is a promise a
+    container that stays up for a month does not keep even once.
+    """
+    while True:
+        await asyncio.sleep(RETENTION_EVERY)
+        try:
+            await _enforce_retention()
+        except Exception:  # noqa: BLE001 - the next pass gets another go
+            log.exception("retention pass failed")
 
 
 app = FastAPI(title="Voice AI Support & Qualification Agent", lifespan=lifespan)
@@ -381,6 +439,7 @@ _PENDING: dict[str, asyncio.Task] = {}
 WORKER = secrets.token_hex(8)
 
 
+
 async def _finalize_later(call: Call) -> None:
     """Write an abandoned call's record once the grace period runs out.
 
@@ -389,8 +448,12 @@ async def _finalize_later(call: Call) -> None:
     anything here, so the hold is asked instead: this copy of the call stopped
     growing when the socket died, and writing it over a call that is live again
     somewhere else would replace the call with half of it.
+
+    Woken early by a shutdown, which is the same question asked sooner: this
+    worker is going away, so the wait it was offering is over either way.
     """
-    await asyncio.sleep(RESUME_GRACE)
+    with suppress(asyncio.TimeoutError):
+        await asyncio.wait_for(app.state.shutting_down.wait(), RESUME_GRACE)
     _PENDING.pop(call.session.id, None)
     if await STORE.take(call.session.id) != WORKER:
         log.info("call %s came back elsewhere; leaving its record to them", call.session.id)
@@ -520,7 +583,11 @@ if __name__ == "__main__":
         )
     # Loopback and no auto-reload by default: reload watches the tree and forks
     # a child, which is a development convenience, not a thing to expose.
+    # A websocket that nobody closes is one uvicorn will wait on forever, and
+    # everything that writes a record lives after that wait. So it is bounded,
+    # inside whatever the thing that sent the signal is prepared to give.
     uvicorn.run(
         "main:app", host=HOST, port=PORT, reload=bool(os.getenv("DEV")),
         workers=WORKERS if WORKERS > 1 else None,
+        timeout_graceful_shutdown=int(SHUTDOWN_GRACE),
     )

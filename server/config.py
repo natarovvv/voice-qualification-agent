@@ -58,6 +58,11 @@ PORT = int(os.getenv("PORT", "8000"))
 # sessions live in a dict each and bookings behind a lock each, and two workers
 # will sell the same slot - so main.py refuses that combination out loud.
 WORKERS = int(os.getenv("WORKERS", "1"))
+# How long uvicorn waits for open connections before it stops waiting, and how
+# long the records of calls in flight get to be written after that. Both live
+# inside whatever the thing that sent the signal is prepared to wait - docker
+# gives 10 seconds and then kills, so compose asks it for more.
+SHUTDOWN_GRACE = float(os.getenv("SHUTDOWN_GRACE", "10"))
 
 # --- limits ---
 SESSION_TTL = int(os.getenv("SESSION_TTL", "1800"))          # seconds
@@ -80,6 +85,10 @@ MAX_CALLS = int(os.getenv("MAX_CALLS", "20"))                # concurrent websoc
 MAX_TEXT_TURNS = 10                                          # typed turns per window
 TEXT_WINDOW = 10.0                                           # seconds
 CALL_RETENTION_DAYS = int(os.getenv("CALL_RETENTION_DAYS", "30"))  # 0 = keep forever
+# How often the retention window is enforced. It used to be enforced at
+# startup and nowhere else, which is a promise a container that stays up for a
+# month never keeps.
+RETENTION_EVERY = float(os.getenv("RETENTION_EVERY", "3600"))      # seconds
 # Fernet keys for the call records on disk. Comma-separated to rotate: the
 # first one seals, any of them opens, so yesterday's records stay readable.
 # Unset means records are written in the clear, which is what they were before
