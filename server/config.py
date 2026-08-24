@@ -53,6 +53,11 @@ ALLOWED_ORIGINS = [
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "")
 HOST = os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("PORT", "8000"))
+# uvicorn worker processes. One is right on a laptop and is what the default
+# says. More than one needs REDIS_URL and DATABASE_URL both set - otherwise
+# sessions live in a dict each and bookings behind a lock each, and two workers
+# will sell the same slot - so main.py refuses that combination out loud.
+WORKERS = int(os.getenv("WORKERS", "1"))
 
 # --- limits ---
 SESSION_TTL = int(os.getenv("SESSION_TTL", "1800"))          # seconds

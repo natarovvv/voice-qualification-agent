@@ -2027,6 +2027,66 @@ def test_reseal_refuses_to_run_without_a_key(pg_store, monkeypatch):
     with pytest.raises(SystemExit):
         resealer().reseal(pg_store)
 
+
+def test_workers_starting_together_do_not_fight_over_the_schema(pg_uri):
+    """What two workers do in the first second of a deploy.
+
+    CREATE TABLE IF NOT EXISTS asks the catalog a question and then acts on
+    the answer, which is two steps: run it in six processes at once against an
+    empty database and one of them loses to a unique violation on
+    pg_type_typname_nsp_index - the table it was told did not exist being
+    created underneath it. Found by starting the compose file, which is the
+    first time this repo had ever run two workers against one database.
+    """
+    import threading
+
+    import storage as storage_mod
+
+    with storage_mod.PostgresStore(url=pg_uri).pool as pool:
+        pool.open()
+        with pool.connection() as conn:
+            conn.execute("DROP TABLE IF EXISTS leads, bookings")
+
+    workers = [storage_mod.PostgresStore(url=pg_uri) for _ in range(6)]
+    ready = threading.Barrier(len(workers))
+    failures: list[Exception] = []
+
+    def start(store):
+        ready.wait()
+        try:
+            store.ensure_schema()
+        except Exception as exc:  # noqa: BLE001 - the whole question is whether there is one
+            failures.append(exc)
+
+    threads = [threading.Thread(target=start, args=(w,)) for w in workers]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    for w in workers:
+        w.pool.close()
+
+    assert not failures, f"a worker could not start: {failures}"
+
+
+def test_more_than_one_worker_needs_the_shared_stores():
+    """The one deployment setting that can quietly cost a caller their slot.
+
+    Two workers with no REDIS_URL keep a session dict each, so a dropped call
+    comes back to a worker that has never heard of it. Two with no DATABASE_URL
+    keep a booking lock each, and a threading.Lock does nothing across
+    processes: both are told the slot is free. Refused at startup rather than
+    warned about, because nobody reads the log of a server that came up.
+    """
+    env = {**os.environ, "WORKERS": "2", "REDIS_URL": "", "DATABASE_URL": ""}
+    proc = subprocess.run(
+        [sys.executable, "main.py"],
+        cwd=pathlib.Path(__file__).resolve().parents[1],
+        env=env, capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode != 0, "it started anyway"
+    assert "REDIS_URL and DATABASE_URL" in proc.stderr, proc.stderr
+
 # --------------------------------------------------- a real redis-server
 
 

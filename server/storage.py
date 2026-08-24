@@ -37,6 +37,10 @@ log = logging.getLogger(__name__)
 
 MAX_RECORDS = 5000  # json backend only; the file is read whole on every call
 
+# The key every worker waits on before touching the schema. Any bigint would
+# do; this one is the word, so a pg_locks row naming it says who is holding it.
+SCHEMA_LOCK = int.from_bytes(b"voice", "big")
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS leads (
     id           bigserial PRIMARY KEY,
@@ -166,6 +170,13 @@ class PostgresStore:
             return
         self.pool.open()
         with self.pool.connection() as conn:
+            # CREATE TABLE IF NOT EXISTS is not atomic against another worker
+            # running it at the same moment: both look, both find nothing, and
+            # the loser gets a unique violation from the catalog itself. Two
+            # workers starting together is the ordinary case rather than the
+            # unlucky one, so they queue here. The lock lasts to the end of
+            # this transaction, and after the first startup it is uncontended.
+            conn.execute("SELECT pg_advisory_xact_lock(%s)", (SCHEMA_LOCK,))
             conn.execute(SCHEMA)
         self._ready = True
         log.info("postgres: leads and bookings ready")
