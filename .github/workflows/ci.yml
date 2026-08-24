@@ -39,6 +39,23 @@ jobs:
         # live tests skip themselves, and pgserver brings its own PostgreSQL.
         run: pytest -q
 
+  # The deploy is the part of a repo that rots without anyone noticing: no other
+  # job here fails if the Dockerfile stops building, or if the page comes up
+  # unable to reach the server. --wait returns when the healthchecks pass, so
+  # this is the stack answering rather than an image that merely built.
+  stack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: docker compose up -d --build --wait
+      - run: curl -fsS http://localhost:8000/health
+      - run: curl -fsS http://localhost:3000 | grep -q "Start call"
+      - name: server log
+        if: always()
+        run: docker compose logs server
+      - if: always()
+        run: docker compose down -v
+
   web:
     runs-on: ubuntu-latest
     steps:

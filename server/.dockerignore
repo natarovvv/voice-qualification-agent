@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+tests/
+# What this deployment writes, not what it ships. kb.json is content and stays.
+data/calls/
+data/leads.json
+data/bookings.json

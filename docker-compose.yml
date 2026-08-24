@@ -1,0 +1,81 @@
+# The whole thing on one machine, with the two backing stores that make more
+# than one worker safe actually there:
+#
+#   docker compose up --build      then open http://localhost:3000
+#
+# The root .env is read if it exists and skipped if it does not, so this comes
+# up with no keys at all - offline LLM, edge-tts, local whisper absent - the
+# same as running it on a laptop. Set AUTH_TOKEN in that .env before this is
+# reachable by anyone else; the web image picks it up as its own copy.
+name: voice-agent
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-voice}
+      POSTGRES_DB: voice
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d voice"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:8-alpine
+    # Sessions only, and they expire on their own. No persistence configured on
+    # purpose: the live transcript is the one thing here that is not sealed, and
+    # a memory-only Redis is why that is defensible. See Known corners.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  server:
+    build: ./server
+    env_file:
+      # Provider keys and AUTH_TOKEN, if there are any. Optional: this file is
+      # not in the repo, and the app is built to run without every line of it.
+      - path: .env
+        required: false
+    environment:
+      # These belong to the deployment rather than to anyone's .env - they name
+      # containers on this network, and would be wrong on a laptop.
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-voice}@postgres:5432/voice
+      REDIS_URL: redis://redis:6379/0
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000}
+      # Two, because both stores above are set, which is the whole condition.
+      WORKERS: ${WORKERS:-2}
+    ports:
+      - "${SERVER_PORT:-8000}:8000"
+    volumes:
+      # Call records. Named rather than a bind mount so docker seeds it from
+      # the image and kb.json is there on the first run.
+      - calls:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  web:
+    build:
+      context: ./web
+      args:
+        # Where the browser reaches the server, which is the published port on
+        # the host - not the name of a container it cannot resolve.
+        NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-ws://localhost:8000}
+        # One secret, two names: this is the browser's copy of AUTH_TOKEN, and
+        # a call is refused when they disagree. So they come from one place.
+        NEXT_PUBLIC_WS_TOKEN: ${AUTH_TOKEN:-}
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    depends_on:
+      - server
+
+volumes:
+  pgdata:
+  calls:

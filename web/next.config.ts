@@ -12,6 +12,10 @@ const securityHeaders = [
 ];
 
 const nextConfig: NextConfig = {
+  // The Docker image runs the build's output directly with node, rather than
+  // shipping npm and the whole dependency tree to do it. Nothing else notices:
+  // next dev and next start behave exactly as before.
+  output: "standalone",
   async headers() {
     return [{ source: "/:path*", headers: securityHeaders }];
   },
