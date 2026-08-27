@@ -15,6 +15,7 @@ import logging
 import os
 import secrets
 import time
+from collections import Counter
 from contextlib import asynccontextmanager, suppress
 
 import httpx
@@ -35,6 +36,7 @@ from config import (
     ECHO_TAIL,
     HOST,
     MAX_CALLS,
+    MAX_CALLS_PER_IP,
     MAX_TEXT_TURNS,
     MAX_TURN_CHARS,
     PORT,
@@ -67,6 +69,7 @@ async def lifespan(app: FastAPI):
     app.state.http = httpx.AsyncClient()
     app.state.llm = llm_mod.make_llm(app.state.http)
     app.state.calls = 0
+    app.state.calls_by_ip = Counter()
     asyncio.create_task(tts.prewarm())  # pay the TLS handshake before a caller does
     log.info(
         "llm provider: %s | sessions: %s | storage: %s",
@@ -519,7 +522,17 @@ async def voice_ws(ws: WebSocket) -> None:
         log.warning("refused a call: %s already live", app.state.calls)
         await ws.close(code=1013)  # try again later
         return
+    ip = ws.client.host if ws.client else "unknown"
+    if app.state.calls_by_ip[ip] >= MAX_CALLS_PER_IP:
+        # Per-socket limits (audio rate, typed turns) only bound one call - they
+        # do nothing to stop one address opening MAX_CALLS of them and leaving
+        # every other caller a busy signal. This bounds the address instead.
+        metrics.count("voice_calls_rejected_total", reason="per_ip")
+        log.warning("refused a call: %s already has %s live", ip, app.state.calls_by_ip[ip])
+        await ws.close(code=1013)  # try again later
+        return
     app.state.calls += 1
+    app.state.calls_by_ip[ip] += 1
     metrics.count("voice_calls_total")
     await ws.accept()
     requested = ws.query_params.get("session_id")
@@ -602,6 +615,9 @@ async def voice_ws(ws: WebSocket) -> None:
         log.exception("websocket failed")
     finally:
         app.state.calls -= 1
+        app.state.calls_by_ip[ip] -= 1
+        if app.state.calls_by_ip[ip] <= 0:
+            del app.state.calls_by_ip[ip]  # a Counter entry per address that ever called would leak
         reader.cancel()
         record = await call.hangup(clean)
         if record:

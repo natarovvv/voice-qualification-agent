@@ -197,6 +197,18 @@ fine in front of a caller — see Security. With no STT the call still connects
 and typed turns still work; the `ready` message reports which STT, TTS and LLM
 actually got picked.
 
+Both hold one websocket open for the whole call rather than one per turn like
+the LLM, so a mid-call drop cannot fail over to the next turn the way an LLM
+provider does — there is no next turn yet, only a socket that just died under
+a call still in progress. Switching to edge-tts there is not the answer either:
+it is a fallback for *no key configured*, not a fallback for *Aura hiccuped*,
+and routing a live caller through an uncontracted endpoint mid-call because
+Deepgram blinked would undo the DPA this section asks for. So both reconnect
+to the same provider instead — one attempt, cooldown-gated so a real outage is
+not hammered — and pick back up with the next sentence sent or transcribed.
+The one still lost is whichever was in flight when the socket died; nothing
+rebuilds a sentence that was already cut off mid-word.
+
 `faster-whisper` and `numpy` are only needed for the local-STT path; nothing
 else imports them.
 
@@ -306,8 +318,10 @@ Server sends PCM16 16 kHz mono frames back, plus JSON:
   for the agent to read back, and only `confirmed=true` — refused unless the
   address was asked about in an earlier turn — persists it. See
   [A real call](#a-real-call).
-- `book_calendar_slot(email, datetime_iso)` — 30-minute slots, weekdays
-  09:00–17:00 UTC, rejects the past and double-books.
+- `book_calendar_slot(email, datetime_iso, confirmed=false)` — 30-minute
+  slots, weekdays 09:00–17:00 UTC, rejects the past and double-books. Same
+  confirm-first contract as the tool above: the first call only reads the
+  slot back, `confirmed=true` is what books it.
 - `lookup_kb(query)` — keyword search over [server/data/kb.json](server/data/kb.json).
   Returns "not found" rather than letting the model improvise.
 
@@ -620,6 +634,24 @@ is honoured. Two mutations, both caught: forgetting which addresses were
 asked about this turn, and honouring a confirmation that was never asked for
 in an earlier one.
 
+`book_calendar_slot` got the same two tests once it got the same gate: a
+misheard "Tuesday at ten" books the wrong slot exactly as quietly as a
+misheard address, so the confirm-then-write shape and the same-turn
+self-confirm guard both apply — the turn-scoped key just has a datetime
+baked into it instead of being bare.
+
+Reconnect gets one test each for STT and TTS: a fake `websockets.connect`
+hands out a socket that dies the instant something is sent to it, then a
+working one, and both tests assert exactly one reconnect happened — no more,
+because the cooldown that stops a real outage from being hammered would
+swallow a second one just as well. The sentence or utterance caught mid-drop
+is asserted lost, not silently recovered, because that is genuinely what
+happens: only the *next* one reaches the caller, on the socket that healed.
+
+A single address opening `MAX_CALLS_PER_IP` sockets gets the same 1013 the
+whole process hands out when `MAX_CALLS` itself is spent — same rejection
+path, same metric, a different reason label to tell them apart.
+
 ## Security
 
 The defaults assume a laptop: the server binds `127.0.0.1` and auto-reload is
@@ -637,7 +669,10 @@ off unless `DEV=1`. Before it listens anywhere else:
   taken from the query string. A caller-chosen id is one it can guess, and
   guessing one lends it someone else's transcript and lead data.
 - Limits per socket: audio at 4x realtime, 10 typed turns per 10 s, and
-  `MAX_CALLS` sockets for the whole process.
+  `MAX_CALLS` sockets for the whole process. None of those bound one *caller*,
+  so `MAX_CALLS_PER_IP` (default 3) does: past it, that address gets the same
+  1013 the whole process gives out when it is full, instead of a free hand to
+  take every slot for itself.
 
 Data and third parties, which are decisions rather than settings:
 
@@ -806,6 +841,14 @@ Data and third parties, which are decisions rather than settings:
   where a 503 usually means the next request fails too, but it does mean one
   unlucky request moves the call to the slower model for half a minute. Count
   failures before benching if you move to a paid tier where a blip is a blip.
+- STT and TTS reconnect is one attempt, not a retry loop: a genuinely dead
+  Deepgram key or a real outage past the 2 s cooldown leaves that half of the
+  call silent for good, same as before this existed. It is sized for a blip,
+  not a sustained failure — a retry loop with backoff is the upgrade if that
+  turns out to matter.
+- `MAX_CALLS_PER_IP` reads `ws.client.host` directly. Behind a reverse proxy
+  every caller shares that one address unless the proxy is configured to pass
+  the real one through and something here is made to trust it.
 - The session copy in Redis is not sealed. It holds the live transcript for
   `SESSION_TTL` (30 minutes) so a dropped call can resume, and Redis is
   normally memory-only; the 30-day copy on disk is the one worth a key. Turn

@@ -48,16 +48,20 @@ async def _run_tools(calls: list[dict], on_tool: ToolSink | None, asked_this_tur
     out = []
     for c in calls:
         args = c.get("args") or {}
+        key = None
         if c["name"] == "check_lead_qualification":
-            email = str(args.get("email", "")).strip().lower()
-            if args.get("confirmed") and email in asked_this_turn:
+            key = str(args.get("email", "")).strip().lower()
+        elif c["name"] == "book_calendar_slot":
+            key = f"{str(args.get('email', '')).strip().lower()}@{args.get('datetime_iso')}"
+        if key is not None:
+            if args.get("confirmed") and key in asked_this_turn:
                 # The model saw its own needs_confirmation this same turn and
                 # tried to answer for the caller instead of waiting for them -
                 # the tool-round loop lets it chain calls with nobody's "yes"
                 # in between. Send it back to ask again, for real this time.
                 c = {**c, "args": {**args, "confirmed": False}}
             elif not args.get("confirmed"):
-                asked_this_turn.add(email)
+                asked_this_turn.add(key)
         # to_thread: the storage backend may be a real database, and a
         # blocking round trip on the event loop would stall every other call.
         result = await asyncio.to_thread(tools.call, c["name"], c.get("args") or {})

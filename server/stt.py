@@ -30,6 +30,7 @@ MAX_UTTERANCE_SEC = 30
 class DeepgramSTT:
     name = "deepgram"
     KEEPALIVE_SEC = 5  # Deepgram closes the socket after ~10 s of nothing
+    RECONNECT_COOLDOWN = 2.0  # a socket that just failed does not get hammered
 
     def __init__(self, api_key: str = DEEPGRAM_API_KEY) -> None:
         self.api_key = api_key
@@ -37,6 +38,7 @@ class DeepgramSTT:
         self._ws = None
         self._reader: asyncio.Task | None = None
         self._last_sent = 0.0
+        self._last_reconnect = 0.0
 
     async def start(self) -> None:
         import websockets
@@ -48,6 +50,21 @@ class DeepgramSTT:
             self._ws = await websockets.connect(DG_URL, extra_headers=headers)
         self._reader = asyncio.create_task(self._read())
         log.info("STT: deepgram nova-2 connected")
+
+    async def _reconnect(self) -> None:
+        """One retry, cooldown-gated. Without it a single dropped socket
+        leaves the agent deaf for whatever remains of the call - the caller
+        keeps talking into a transcriber that stopped listening after start().
+        """
+        now = time.monotonic()
+        if now - self._last_reconnect < self.RECONNECT_COOLDOWN:
+            return
+        self._last_reconnect = now
+        try:
+            await self.start()
+            log.info("STT: deepgram reconnected after a drop")
+        except Exception as exc:  # noqa: BLE001 - still deaf beats a dead call
+            log.warning("STT: deepgram reconnect failed: %s", exc)
 
     async def _read(self) -> None:
         try:
@@ -70,6 +87,10 @@ class DeepgramSTT:
             raise
         except Exception as exc:  # noqa: BLE001 - connection drops end the stream
             log.warning("deepgram reader stopped: %s", exc)
+            self._ws = None
+            # ponytail: one shot, not a retry loop - good enough for a blip,
+            # give up quietly if the outage outlasts it.
+            await self._reconnect()
 
     async def send(self, pcm: bytes) -> None:
         if self._ws:

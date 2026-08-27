@@ -98,10 +98,12 @@ class DeepgramTTS:
 
     name = "deepgram-aura"
     DRAIN_TIMEOUT = 3.0  # a dead socket must not hang the call
+    RECONNECT_COOLDOWN = 2.0  # a socket that just failed does not get hammered
 
     def __init__(self, api_key: str = DEEPGRAM_API_KEY, model: str = DEEPGRAM_TTS_MODEL) -> None:
         self.api_key, self.model = api_key, model
         self._ws = None
+        self._last_reconnect = 0.0
 
     @property
     def _url(self) -> str:
@@ -120,10 +122,29 @@ class DeepgramTTS:
             self._ws = await websockets.connect(self._url, extra_headers=headers)
         log.info("TTS: deepgram %s connected", self.model)
 
+    async def _reconnect(self) -> None:
+        """One retry, cooldown-gated. Without it a single dropped socket
+        leaves the agent mute for whatever remains of the call - every later
+        speak() finds self._ws is None and returns nothing, forever.
+        """
+        now = asyncio.get_running_loop().time()
+        if now - self._last_reconnect < self.RECONNECT_COOLDOWN:
+            return
+        self._last_reconnect = now
+        try:
+            await self.start()
+            log.info("TTS: deepgram reconnected after a drop")
+        except Exception as exc:  # noqa: BLE001 - still mute beats a dead call
+            log.warning("TTS: deepgram reconnect failed: %s", exc)
+
     async def speak(self, text: str) -> AsyncIterator[bytes]:
         text = _clean(text)
-        if not text or self._ws is None:
+        if not text:
             return
+        if self._ws is None:
+            await self._reconnect()
+            if self._ws is None:
+                return
         try:
             await self._ws.send(json.dumps({"type": "Speak", "text": text}))
             await self._ws.send(json.dumps({"type": "Flush"}))
@@ -137,6 +158,10 @@ class DeepgramTTS:
             raise  # barge-in; the socket is put back in order by reset()
         except Exception as exc:  # noqa: BLE001 - a dead voice must not kill the call
             log.warning("tts failed for %r: %s", text[:40], exc)
+            self._ws = None
+            # ponytail: one shot, not a retry loop - good enough for a blip,
+            # give up quietly if the outage outlasts it. Next sentence tries again.
+            await self._reconnect()
 
     async def reset(self) -> None:
         """Drop the audio still in flight for an abandoned sentence.
