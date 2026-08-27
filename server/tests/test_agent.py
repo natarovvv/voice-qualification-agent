@@ -25,6 +25,7 @@ import llm
 import main as main_mod
 import metrics
 import session as session_mod
+import stt
 import storage
 import tools
 import tts
@@ -96,6 +97,29 @@ def test_qualification_rejects_bad_input():
     assert tools.check_lead_qualification("a@b.co", "dunno")["error"] == "unknown_company_size"
 
 
+def test_booking_asks_for_confirmation_before_writing_anything():
+    """Same shape as the lead-confirmation gate: a misheard "Tuesday at ten"
+    books the wrong slot just as quietly as a misheard email, so the first
+    call must not be the one that writes it."""
+    slot = next_weekday_slot(hour=14, days_ahead=2)
+    first = tools.book_calendar_slot("diary@acmycorp.io", slot)
+    assert first == {
+        "ok": False,
+        "error": "needs_confirmation",
+        "message": f"Read '{datetime.strptime(slot, '%Y-%m-%d %H:%M').strftime('%A %d %B at %H:%M')} UTC' "
+        "back to the caller before booking it.",
+        "email": "diary@acmycorp.io",
+        "datetime_iso": slot,
+    }
+    assert not any(
+        b["email"] == "diary@acmycorp.io" for b in storage.STORAGE._load("bookings")
+    )
+
+    second = tools.book_calendar_slot("diary@acmycorp.io", slot, confirmed=True)
+    assert second["ok"]
+    assert storage.STORAGE._load("bookings")[-1]["email"] == "diary@acmycorp.io"
+
+
 def test_booking_rejects_past_and_off_hours():
     assert tools.book_calendar_slot("a@b.co", "2020-01-01 10:00")["error"] == "in_the_past"
     assert tools.book_calendar_slot("a@b.co", next_weekday_slot(hour=3))["error"] == "outside_business_hours"
@@ -104,8 +128,8 @@ def test_booking_rejects_past_and_off_hours():
 
 def test_booking_blocks_double_booking():
     slot = next_weekday_slot(hour=11, days_ahead=3)
-    assert tools.book_calendar_slot("first@acme.io", slot)["ok"]
-    clash = tools.book_calendar_slot("second@acme.io", slot)
+    assert tools.book_calendar_slot("first@acme.io", slot, confirmed=True)["ok"]
+    clash = tools.book_calendar_slot("second@acme.io", slot, confirmed=True)
     assert clash["error"] == "slot_taken"
 
 
@@ -751,6 +775,20 @@ def test_a_call_turned_away_says_why_and_is_not_counted_as_served(
     assert got["voice_calls_total"] == 0
 
 
+def test_one_address_cannot_fill_every_slot(client, fresh_metrics, monkeypatch):
+    """Per-socket limits (audio rate, typed turns) bound one call, not one
+    caller - without a per-address cap, one address opening MAX_CALLS of them
+    leaves every other caller the same busy signal MAX_CALLS itself gives."""
+    monkeypatch.setattr(main_mod, "MAX_CALLS_PER_IP", 0)
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect("/ws") as ws:
+            ws.receive()
+
+    got = exposition(client)
+    assert got['voice_calls_rejected_total{reason="per_ip"}'] == 1
+    assert got["voice_calls_total"] == 0
+
+
 def test_the_scrape_is_behind_the_token_when_one_is_set(client, monkeypatch):
     """How busy the box is and how well it is coping is operator business."""
     monkeypatch.setattr(main_mod, "AUTH_TOKEN", "s3cret")
@@ -1031,6 +1069,44 @@ async def test_a_model_cannot_confirm_a_lead_without_the_caller_in_between():
     assert all(row["email"] != "cto@confirm-guard.io" for row in storage.STORAGE._load("leads"))
 
 
+async def test_a_model_cannot_confirm_a_booking_without_the_caller_in_between():
+    """Same guard, same shape of exploit, aimed at the calendar tool - the
+    turn-scoped key just has a datetime baked into it instead of being bare."""
+    slot = next_weekday_slot(hour=10, days_ahead=5)
+
+    def round_msg(call_id: str, args: dict) -> str:
+        payload = {
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0, "id": call_id,
+                "function": {"name": "book_calendar_slot", "arguments": json.dumps(args)},
+            }]}}]
+        }
+        return f"data: {json.dumps(payload)}\n\ndata: [DONE]\n\n"
+
+    rounds = [
+        round_msg("c1", {"email": "cto@confirm-guard.io", "datetime_iso": slot}),
+        round_msg("c2", {"email": "cto@confirm-guard.io", "datetime_iso": slot, "confirmed": True}),
+        'data: {"choices":[{"delta":{"content":"Okay."}}]}\n\ndata: [DONE]\n\n',
+    ]
+    calls = iter(rounds)
+
+    async def record(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=next(calls))
+
+    seen = []
+
+    async def on_tool(name, args, result):
+        seen.append((args, result))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(record)) as http:
+        provider = llm.GroqLLM(http, "key")
+        assert await spoken(provider, on_tool) == ["Okay."]
+
+    assert [r["error"] for _, r in seen] == ["needs_confirmation", "needs_confirmation"]
+    assert seen[1][0]["confirmed"] is False, "the self-confirm attempt must be downgraded, not honoured"
+    assert not any(b["email"] == "cto@confirm-guard.io" for b in storage.STORAGE._load("bookings"))
+
+
 def test_the_chain_is_built_from_the_keys_that_are_set(monkeypatch):
     monkeypatch.setattr(llm, "GROQ_API_KEY", "g")
     monkeypatch.setattr(llm, "GEMINI_API_KEY", "")
@@ -1045,6 +1121,108 @@ def test_the_chain_is_built_from_the_keys_that_are_set(monkeypatch):
     monkeypatch.setattr(llm, "GROQ_API_KEY", "")
     monkeypatch.setattr(llm, "GEMINI_API_KEY", "")
     assert llm.make_llm(None).name == "offline"
+
+
+def test_tts_reconnects_after_a_dropped_socket(monkeypatch):
+    """Without a reconnect, one dead Aura socket leaves the agent mute for
+    whatever remains of the call - every later speak() finds self._ws is
+    None and returns nothing, forever."""
+    import websockets
+
+    class DeadWS:
+        async def send(self, *_a):
+            raise RuntimeError("socket dropped")
+
+        async def close(self):
+            pass
+
+    class LiveWS:
+        def __init__(self):
+            self._recv_calls = 0
+
+        async def send(self, *_a):
+            pass
+
+        async def recv(self):
+            self._recv_calls += 1
+            return b"\x01\x02" if self._recv_calls == 1 else json.dumps({"type": "Flushed"})
+
+        async def close(self):
+            pass
+
+    made = []
+
+    async def fake_connect(*_a, **_kw):
+        made.append(1)
+        return DeadWS() if len(made) == 1 else LiveWS()
+
+    monkeypatch.setattr(websockets, "connect", fake_connect)
+
+    async def drive():
+        voice = tts.DeepgramTTS(api_key="k")
+        await voice.start()  # connects the socket that is about to die
+
+        lost = bytearray()
+        async for pcm in voice.speak("hi"):
+            lost.extend(pcm)
+        assert lost == b"", "the sentence caught mid-failure is lost, not recovered"
+        assert voice._ws is not None, "the failed sentence should have triggered a reconnect"
+
+        heard = bytearray()
+        async for pcm in voice.speak("hi again"):
+            heard.extend(pcm)
+        assert heard == b"\x01\x02", "the next sentence should reach the caller on the healed socket"
+
+    asyncio.run(drive())
+    assert len(made) == 2, "exactly one reconnect: drop, then heal"
+
+
+async def test_stt_reconnects_after_a_dropped_socket(monkeypatch):
+    """Same failure, the listening half: without a reconnect the agent goes
+    deaf the moment Deepgram's reader task dies, and never notices again."""
+    import websockets
+
+    class DeadWS:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise RuntimeError("socket dropped")
+
+    class LiveWS:
+        def __init__(self):
+            self._sent = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._sent:
+                raise StopAsyncIteration
+            self._sent = True
+            return json.dumps({
+                "type": "Results",
+                "channel": {"alternatives": [{"transcript": "hello"}]},
+                "is_final": True,
+                "speech_final": True,
+            })
+
+    made = []
+
+    async def fake_connect(*_a, **_kw):
+        made.append(1)
+        return DeadWS() if len(made) == 1 else LiveWS()
+
+    monkeypatch.setattr(websockets, "connect", fake_connect)
+
+    voice = stt.DeepgramSTT(api_key="k")
+    await voice.start()
+    await voice._reader  # the dead reader dies, reconnects inline, and returns
+    assert voice._ws is not None, "the dead reader should have triggered a reconnect"
+
+    event = await asyncio.wait_for(voice.events.get(), timeout=2)
+    assert event["text"] == "hello", "the healed socket should still reach the agent"
+    assert len(made) == 2, "exactly one reconnect: drop, then heal"
 
 
 def real_deepgram_key() -> str:
@@ -1276,7 +1454,7 @@ def seed_caller(email: str) -> str:
     )
     while slot.weekday() >= 5:
         slot += timedelta(days=1)
-    tools.book_calendar_slot(email, slot.strftime("%Y-%m-%d %H:%M"))
+    tools.book_calendar_slot(email, slot.strftime("%Y-%m-%d %H:%M"), confirmed=True)
     s = session_mod.Session(id=secrets.token_urlsafe(8))
     s.add_turn("user", "please delete my data afterwards")
     s.add_tool_call(
@@ -1664,9 +1842,9 @@ def test_a_booking_still_refuses_an_overlap_through_the_seal(sealed):
     """The calendar reads every row back to answer "is this free". Sealing the
     file must not cost the one invariant the file backend still holds."""
     slot = next_weekday_slot(hour=11, days_ahead=3)
-    assert tools.book_calendar_slot("one@acme-corp.io", slot)["ok"]
+    assert tools.book_calendar_slot("one@acme-corp.io", slot, confirmed=True)["ok"]
 
-    second = tools.book_calendar_slot("two@acme-corp.io", slot)
+    second = tools.book_calendar_slot("two@acme-corp.io", slot, confirmed=True)
     assert not second["ok"] and second["error"] == "slot_taken"
 
 
@@ -2239,9 +2417,9 @@ def test_the_tools_run_against_postgres(pg_store, monkeypatch):
     assert qualified["ok"] and qualified["tier"] == "hot"
 
     when = slot(days_ahead=5)
-    booked = tools.book_calendar_slot("cfo@bigco.com", when.strftime("%Y-%m-%d %H:%M"))
+    booked = tools.book_calendar_slot("cfo@bigco.com", when.strftime("%Y-%m-%d %H:%M"), confirmed=True)
     assert booked["ok"], booked
-    clash = tools.book_calendar_slot("other@bigco.com", when.strftime("%Y-%m-%d %H:%M"))
+    clash = tools.book_calendar_slot("other@bigco.com", when.strftime("%Y-%m-%d %H:%M"), confirmed=True)
     assert clash["error"] == "slot_taken"
 
     erased = tools.erase_caller("cfo@bigco.com")

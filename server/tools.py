@@ -123,8 +123,13 @@ def _parse_dt(value: str) -> datetime | None:
     return None
 
 
-def book_calendar_slot(email: str, datetime_iso: str) -> dict:
-    """Book a 30-minute slot. Rejects the past, off-hours and double-books."""
+def book_calendar_slot(email: str, datetime_iso: str, confirmed: bool = False) -> dict:
+    """Book a 30-minute slot. Rejects the past, off-hours and double-books.
+
+    Same shape as check_lead_qualification's confirm gate: a misheard "Tuesday
+    at ten" books the wrong slot just as quietly as a misheard email address,
+    so the first call never writes anything either - only confirmed=true does.
+    """
     email = (email or "").strip().lower()
     if not EMAIL_RE.match(email):
         return {"ok": False, "error": "invalid_email", "message": "That email address is not valid."}
@@ -147,6 +152,15 @@ def book_calendar_slot(email: str, datetime_iso: str) -> dict:
             "ok": False,
             "error": "outside_business_hours",
             "message": "Slots run weekdays 09:00-17:00 UTC. Offer the nearest one.",
+        }
+
+    if not confirmed:
+        return {
+            "ok": False,
+            "error": "needs_confirmation",
+            "message": f"Read '{start:%A %d %B at %H:%M} UTC' back to the caller before booking it.",
+            "email": email,
+            "datetime_iso": datetime_iso,
         }
 
     end = start + timedelta(minutes=SLOT_MINUTES)
@@ -294,6 +308,13 @@ SCHEMAS: list[dict] = [
             "properties": {
                 "email": {"type": "string", "description": "The caller's email address."},
                 "datetime_iso": {"type": "string", "description": "Slot start in UTC as YYYY-MM-DD HH:MM."},
+                "confirmed": {
+                    "type": "boolean",
+                    "description": (
+                        "Leave false the first time. It returns the time for you to read back; "
+                        "call again with confirmed=true only after the caller confirms it."
+                    ),
+                },
             },
             "required": ["email", "datetime_iso"],
         },

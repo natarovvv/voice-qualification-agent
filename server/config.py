@@ -82,6 +82,7 @@ MAX_TURN_CHARS = 2000                                        # sanitize user tex
 MAX_HISTORY_TURNS = 24
 RATE_LIMIT_FACTOR = 4                                        # x realtime audio allowed
 MAX_CALLS = int(os.getenv("MAX_CALLS", "20"))                # concurrent websockets
+MAX_CALLS_PER_IP = int(os.getenv("MAX_CALLS_PER_IP", "3"))    # concurrent websockets, one address
 MAX_TEXT_TURNS = 10                                          # typed turns per window
 TEXT_WINDOW = 10.0                                           # seconds
 CALL_RETENTION_DAYS = int(os.getenv("CALL_RETENTION_DAYS", "30"))  # 0 = keep forever
@@ -112,7 +113,8 @@ Your job, in order:
    It replies asking you to read the email and size back; do that, and only call it again
    with confirmed=true once the caller agrees they are right.
 3. If they qualify, offer a call with a specialist and use book_calendar_slot.
+   It replies asking you to read the time back; do that, and only call it again
+   with confirmed=true once the caller agrees it is right.
 
-Confirm a time the same way: read it back before you use it in a tool.
 If a tool fails, say so plainly and offer to take a message.
 """
