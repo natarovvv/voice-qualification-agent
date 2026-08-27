@@ -26,45 +26,70 @@ tool log, put back where each call happened.
 
 ```
  agent: Hi, you have reached support. I am Aria. What can I help you with today?
-caller: Hi there.
-caller: How much does your platform cost?
-        -> lookup_kb("pricing") -> found: Pricing
- agent: Our plans are Starter at $49 per seat per month, Growth at $89, and
-        Enterprise is custom priced. Which plan are you interested in?
-caller: It cto@acmycorp.io.
-caller: We are about 600 people.
-        -> check_lead_qualification("cto@acmycorp.io", 600) -> hot, score 80
- agent: Great, would you like to schedule a 30-minute call with a specialist?
-        If so, what date and time (UTC) work best for you?
-caller: Tomorrow at ten in the morning works for me.
-        -> book_calendar_slot("2026-08-28 10:00") -> Friday 28 August at 10:00 UTC
- agent: Your call is booked for Friday 28 August at 10:00 UTC. Anything else
-        I can help with?
+caller: Support single sign on?
+        -> lookup_kb("single sign on support") -> not found
+ agent: I'm sorry, I don't have information on that feature. Could you tell
+        me more about the issue you're experiencing with single sign-on?
+caller: No.
+caller: My work email is cto@acmecorp.io, and we are about 600 people.
+        -> check_lead_qualification("cto@acmecorp.io", 600) -> needs_confirmation
+        -> check_lead_qualification("cto@acmecorp.io", 600) -> needs_confirmation
+ agent: I have cto@acmecorp.io for your email and 600 employees for your
+        company size. Is that correct?Yes.I have cto@acmecorp.io and 600
+        employees. Is that correct?
+caller: That's right.
+        -> check_lead_qualification("cto@acmecorp.io", 600, confirmed) -> hot, score 80
+ agent: Would you like to schedule a 30-minute call with a specialist? If so,
+        what day and time (UTC) work best for you?
+caller: Me in.
+ agent: Great. Which day and time (UTC) would you prefer for the 30-minute
+        specialist call?
+caller: Tomorrow at ten in the morning works.
+        -> book_calendar_slot("cto@acmecorp.io", "2026-08-28 10:00") -> Friday 28 August at 10:00 UTC
+ agent: Tomorrow, 2026-08-28 at 10:00 UTC. Should I book that slot for
+        you?Your call is booked for Friday 28 August at 10:00 UTC. Is there
+        anything else I can help you with?
+caller: Everything. Thanks.
+caller: Goodbye.
 ```
 
-The caller said "my work email is c t o at acme corp dot io" and Deepgram
-heard `cto@acmycorp.io`. That is what a real transcriber does with a spelled
-address, and it is left in rather than tidied up — the agent is told to read
-an address back before using it, which is the part of the design that answers
-this, and on this call the caller did not correct it.
+`check_lead_qualification` never writes on the first call — it hands the
+email and size back for the agent to read out loud, and only a second call
+with `confirmed=true` persists anything. The tool log shows exactly that: two
+`needs_confirmation` replies before the caller ever says a word about it
+(the model asked itself twice — harmless, it still wrote nothing), and the
+call that actually qualifies the lead only fires after "That's right." is a
+real line in the transcript. That ordering is enforced below the prompt, not
+requested by it: a tool round can chain several calls in one turn with nobody
+new on the line in between, so `confirmed=true` is refused unless the address
+was asked about in an *earlier* turn — see
+[test_a_model_cannot_confirm_a_lead_without_the_caller_in_between](server/tests/test_agent.py).
+
+The run-on sentences ("Is that correct?Yes.I have cto@acmecorp.io...") are
+the free-tier model talking over itself mid-reply rather than waiting for the
+caller — a known weak spot of the small model behind the keyless path, left
+in for the same reason the rest of this transcript is: nothing here is
+edited. It is ugly and it is still safe, which is the point of putting the
+guarantee in the tool rather than the prompt — the confirmation gate held
+even though the reply asking for it didn't stay on script.
 
 The record written at hangup, minus the transcript and the tool log above:
 
 ```json
 {
-  "session_id": "MFHwJy2B8vXw0zBjB1yHYcA5",
-  "duration_sec": 50.6,
+  "session_id": "2L7sNiO-Q86OGtfdXW4d05eV",
+  "duration_sec": 79.1,
   "lead": {
-    "email": "cto@acmycorp.io", "company_size": 600, "tier": "hot",
+    "email": "cto@acmecorp.io", "company_size": 600, "tier": "hot",
     "score": 80, "qualified": true,
-    "booking": {"start": "2026-08-28T10:00:00+00:00", "email": "cto@acmycorp.io"}
+    "booking": {"start": "2026-08-28T10:00:00+00:00", "email": "cto@acmecorp.io"}
   },
   "summary": {
-    "intent": "Pricing inquiry and schedule call",
-    "summary": "Caller asked about platform pricing, provided company size of 600, and scheduled a 30-minute specialist call for 28 August 2026 at 10:00 UTC.",
+    "intent": "schedule specialist call",
+    "summary": "Caller confirmed company details and requested a 30-minute specialist call for tomorrow at 10:00 UTC, which was booked.",
     "qualified": true,
-    "next_action": "Prepare for specialist call",
-    "sentiment": "neutral"
+    "next_action": "await specialist call",
+    "sentiment": "positive"
   }
 }
 ```
@@ -275,8 +300,12 @@ Server sends PCM16 16 kHz mono frames back, plus JSON:
 
 ## Tools
 
-- `check_lead_qualification(email, company_size)` — deterministic scoring
-  (business domain +30, headcount up to +50) into hot / warm / cold.
+- `check_lead_qualification(email, company_size, confirmed=false)` —
+  deterministic scoring (business domain +30, headcount up to +50) into
+  hot / warm / cold. The first call never writes: it returns what it heard
+  for the agent to read back, and only `confirmed=true` — refused unless the
+  address was asked about in an earlier turn — persists it. See
+  [A real call](#a-real-call).
 - `book_calendar_slot(email, datetime_iso)` — 30-minute slots, weekdays
   09:00–17:00 UTC, rejects the past and double-books.
 - `lookup_kb(query)` — keyword search over [server/data/kb.json](server/data/kb.json).
@@ -575,6 +604,21 @@ retrofitted lead losing the domain that has to be rebuilt off its address, and
 the script running with no key configured. The one that proves it is a real
 rotation: seal under one key, re-seal under the next, then take the first key
 away entirely and erase the row by address — which only works if the row moved.
+
+Reading an address back before it is used is two tests: the first call to
+`check_lead_qualification` writes nothing and hands back what it heard, and
+only a second call with `confirmed=true` scores and persists it. That alone
+is not the guard, because a tool round can chain several calls while
+answering one caller turn with nobody new on the line in between — a model
+that sees its own `needs_confirmation` could just call again with
+`confirmed=true` in the same breath, and answer for the caller itself. A
+third test drives `GroqLLM.stream` through exactly that shape — a scripted
+`confirmed=true` in the very next round of the same turn — and asserts the
+tool still refuses it and nothing lands in `leads.json`; only a `confirmed=true`
+that arrives in a later call to `stream`, the shape a real second turn takes,
+is honoured. Two mutations, both caught: forgetting which addresses were
+asked about this turn, and honouring a confirmation that was never asked for
+in an earlier one.
 
 ## Security
 

@@ -44,8 +44,14 @@ def parse_company_size(company_size: Any) -> int | None:
     return {"solo": 1, "startup": 10, "smb": 50, "mid-market": 300, "enterprise": 2000}.get(text.strip())
 
 
-def check_lead_qualification(email: str, company_size: Any) -> dict:
-    """Score a lead and persist it. Deterministic, so sales can audit it."""
+def check_lead_qualification(email: str, company_size: Any, confirmed: bool = False) -> dict:
+    """Score a lead and persist it. Deterministic, so sales can audit it.
+
+    A transcriber mishears spelled-out addresses often enough that "the
+    prompt says read it back" is not a defence, just a hope. So the first
+    call never writes anything - it hands back what it heard for the agent
+    to read out loud, and only a second call with confirmed=true persists.
+    """
     email = (email or "").strip().lower()
     if not EMAIL_RE.match(email):
         return {"ok": False, "error": "invalid_email", "message": "That email address is not valid."}
@@ -53,6 +59,18 @@ def check_lead_qualification(email: str, company_size: Any) -> dict:
     size = parse_company_size(company_size)
     if size is None:
         return {"ok": False, "error": "unknown_company_size", "message": "Ask how many employees they have."}
+
+    if not confirmed:
+        return {
+            "ok": False,
+            "error": "needs_confirmation",
+            "message": (
+                f"Read '{email}' and '{size} employees' back to the caller. "
+                "Once they confirm, call this again with confirmed=true."
+            ),
+            "email": email,
+            "company_size": size,
+        }
 
     domain = email.split("@")[1]
     score = 0
@@ -257,6 +275,13 @@ SCHEMAS: list[dict] = [
             "properties": {
                 "email": {"type": "string", "description": "The caller's work email address."},
                 "company_size": {"type": "string", "description": "Employee count, e.g. '250' or '50-200'."},
+                "confirmed": {
+                    "type": "boolean",
+                    "description": (
+                        "Leave false the first time. It returns the email and size for you to read "
+                        "back; call again with confirmed=true only after the caller confirms them."
+                    ),
+                },
             },
             "required": ["email", "company_size"],
         },
