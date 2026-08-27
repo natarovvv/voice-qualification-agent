@@ -256,7 +256,8 @@ class PostgresStore:
         # has not been refused, it has not been answered. Nothing of its own
         # was written, and by the time it comes back the winner has committed,
         # which turns the question into the ordinary one.
-        for attempt in range(3):
+        DEADLOCK_ATTEMPTS = 10
+        for attempt in range(DEADLOCK_ATTEMPTS):
             try:
                 with self.pool.connection() as conn, conn.transaction():
                     # ponytail: read-committed, so two simultaneous bookings can
@@ -280,15 +281,18 @@ class PostgresStore:
                 # is true even when the deciding worker is not this one.
                 return "slot_taken"
             except psycopg.errors.DeadlockDetected:
-                log.warning("booking deadlocked; asking again (%s/3)", attempt + 1)
-                if attempt == 2:
-                    raise  # three of these in a row is not contention any more
+                log.warning("booking deadlocked; asking again (%s/%s)", attempt + 1, DEADLOCK_ATTEMPTS)
+                if attempt == DEADLOCK_ATTEMPTS - 1:
+                    raise  # this many in a row is not contention any more
                 # Not immediately, and not all together: everyone who lost the
                 # last tie is holding the same question, and asking it again in
-                # lockstep deadlocks the same way it just did. The jitter is
-                # what breaks the herd up; without it six racers can spend all
-                # three attempts colliding with each other.
-                time.sleep(random.uniform(0.01, 0.05) * (attempt + 1))
+                # lockstep deadlocks the same way it just did. A jitter band that
+                # stays narrow as attempts grow measurably does not break up six
+                # racers landing on the exact same slot at the exact same instant
+                # - they keep re-forming the same deadlock as a group for round
+                # after round. Doubling the ceiling each attempt (full jitter,
+                # capped) spreads retries out fast enough that it actually does.
+                time.sleep(random.uniform(0, min(0.02 * 2 ** attempt, 2.0)))
 
     def purge(self, days: int) -> dict:
         if days <= 0:
