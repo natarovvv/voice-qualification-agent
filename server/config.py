@@ -83,6 +83,12 @@ MAX_HISTORY_TURNS = 24
 RATE_LIMIT_FACTOR = 4                                        # x realtime audio allowed
 MAX_CALLS = int(os.getenv("MAX_CALLS", "20"))                # concurrent websockets
 MAX_CALLS_PER_IP = int(os.getenv("MAX_CALLS_PER_IP", "3"))    # concurrent websockets, one address
+# Off by default: ws.client.host is the TCP peer, which is a reverse proxy's own
+# address once there is one in front of this. Turn this on only behind a proxy
+# that overwrites (never appends to) X-Forwarded-For - trusting a header a
+# caller can set themselves would let them claim any address and walk straight
+# through MAX_CALLS_PER_IP.
+TRUST_PROXY_HEADERS = os.getenv("TRUST_PROXY_HEADERS", "false").lower() == "true"
 MAX_TEXT_TURNS = 10                                          # typed turns per window
 TEXT_WINDOW = 10.0                                           # seconds
 CALL_RETENTION_DAYS = int(os.getenv("CALL_RETENTION_DAYS", "30"))  # 0 = keep forever

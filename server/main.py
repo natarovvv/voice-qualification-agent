@@ -38,6 +38,7 @@ from config import (
     MAX_CALLS,
     MAX_CALLS_PER_IP,
     MAX_TEXT_TURNS,
+    TRUST_PROXY_HEADERS,
     MAX_TURN_CHARS,
     PORT,
     CALL_RETENTION_DAYS,
@@ -235,6 +236,43 @@ async def erase(email: str, request: Request) -> dict:
     # The address is the thing being erased, so it does not go in the log.
     log.info("erasure request completed: %s", result["removed"])
     return result
+
+
+@app.get("/data")
+async def export(email: str, request: Request) -> dict:
+    """Everything held about one caller - the right-to-access handle.
+
+    Same gate as DELETE /data, for the same reason: operator-only, and
+    refused outright unless AUTH_TOKEN is configured. An access request
+    arrives by mail or through support and a human runs this; the agent
+    cannot reach it.
+    """
+    if not AUTH_TOKEN:
+        raise HTTPException(503, "set AUTH_TOKEN to enable data access requests")
+    if not bearer_ok(request):
+        raise HTTPException(401, "bad token")
+    result = await asyncio.to_thread(tools.export_caller, email)
+    if not result["ok"]:
+        raise HTTPException(400, result["error"])
+    # The address is the thing being requested, so it does not go in the log.
+    log.info("access request completed: %s leads, %s bookings, %s calls",
+              len(result["data"]["leads"]), len(result["data"]["bookings"]), len(result["data"]["calls"]))
+    return result
+
+
+def client_ip(ws: WebSocket) -> str:
+    """The address MAX_CALLS_PER_IP counts against.
+
+    ws.client.host is the TCP peer - correct with nothing in front of this,
+    and wrong (the proxy's own address, shared by every caller) behind one.
+    TRUST_PROXY_HEADERS opts into the header instead, and is only safe when
+    whatever sits in front overwrites it rather than passing a caller's own
+    value through.
+    """
+    if TRUST_PROXY_HEADERS and (forwarded := ws.headers.get("x-forwarded-for")):
+        # ponytail: first hop only, one trusted proxy assumed - not a chain.
+        return forwarded.split(",")[0].strip()
+    return ws.client.host if ws.client else "unknown"
 
 
 def authorized(ws: WebSocket) -> bool:
@@ -522,7 +560,7 @@ async def voice_ws(ws: WebSocket) -> None:
         log.warning("refused a call: %s already live", app.state.calls)
         await ws.close(code=1013)  # try again later
         return
-    ip = ws.client.host if ws.client else "unknown"
+    ip = client_ip(ws)
     if app.state.calls_by_ip[ip] >= MAX_CALLS_PER_IP:
         # Per-socket limits (audio rate, typed turns) only bound one call - they
         # do nothing to stop one address opening MAX_CALLS of them and leaving

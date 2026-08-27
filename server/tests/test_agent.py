@@ -789,6 +789,41 @@ def test_one_address_cannot_fill_every_slot(client, fresh_metrics, monkeypatch):
     assert got["voice_calls_total"] == 0
 
 
+def test_forwarded_for_is_ignored_unless_trusted(client, fresh_metrics, monkeypatch):
+    """X-Forwarded-For is a header any caller can set on themselves. Trusting
+    it by default would let one socket claim a fresh address per connection
+    and walk straight through MAX_CALLS_PER_IP, which counts the real TCP
+    peer instead as long as this is off."""
+    monkeypatch.setattr(main_mod, "MAX_CALLS_PER_IP", 1)
+    monkeypatch.setattr(main_mod, "TRUST_PROXY_HEADERS", False)
+    with client.websocket_connect("/ws", headers={"x-forwarded-for": "9.9.9.9"}) as first:
+        first.receive()
+        # Same TCP peer (the test client), a different claimed address - still
+        # counted against the real peer, so the cap of 1 catches it here too.
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect("/ws", headers={"x-forwarded-for": "1.1.1.1"}) as ws:
+                ws.receive()
+    assert exposition(client)['voice_calls_rejected_total{reason="per_ip"}'] == 1
+
+
+def test_forwarded_for_is_trusted_once_configured(client, fresh_metrics, monkeypatch):
+    monkeypatch.setattr(main_mod, "MAX_CALLS_PER_IP", 1)
+    monkeypatch.setattr(main_mod, "TRUST_PROXY_HEADERS", True)
+    with client.websocket_connect("/ws", headers={"x-forwarded-for": "1.2.3.4"}) as first:
+        first.receive()  # past the accept, so calls_by_ip is already counted
+
+        # same forwarded address, second socket: hits the cap
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect("/ws", headers={"x-forwarded-for": "1.2.3.4"}) as ws:
+                ws.receive()
+
+        # a different forwarded address is a different bucket
+        with client.websocket_connect("/ws", headers={"x-forwarded-for": "5.6.7.8"}) as second:
+            second.receive()
+
+    assert exposition(client)['voice_calls_rejected_total{reason="per_ip"}'] == 1
+
+
 def test_the_scrape_is_behind_the_token_when_one_is_set(client, monkeypatch):
     """How busy the box is and how well it is coping is operator business."""
     monkeypatch.setattr(main_mod, "AUTH_TOKEN", "s3cret")
@@ -1225,6 +1260,59 @@ async def test_stt_reconnects_after_a_dropped_socket(monkeypatch):
     assert len(made) == 2, "exactly one reconnect: drop, then heal"
 
 
+async def test_whisper_transcribes_a_buffered_utterance(monkeypatch):
+    """The local fallback never runs elsewhere in this suite - DEEPGRAM_API_KEY
+    is set in every other test's environment, so make_stt never picks it up.
+    Exercised directly here so a break in it is caught in CI, not on someone's
+    laptop demo the day their Deepgram key is missing."""
+    import types
+
+    class FakeSegment:
+        def __init__(self, text):
+            self.text = text
+
+    class FakeModel:
+        def __init__(self, *_a, **_kw):
+            pass
+
+        def transcribe(self, samples, language=None, beam_size=None, vad_filter=None):
+            return [FakeSegment("hello there")], None
+
+    fake_fw = types.ModuleType("faster_whisper")
+    fake_fw.WhisperModel = FakeModel
+    monkeypatch.setitem(sys.modules, "faster_whisper", fake_fw)
+
+    class FakeArray:
+        def astype(self, _dtype):
+            return self
+
+        def __truediv__(self, _n):
+            return self
+
+    fake_np = types.ModuleType("numpy")
+    fake_np.frombuffer = lambda *_a, **_kw: FakeArray()
+    fake_np.int16 = "int16"
+    fake_np.float32 = "float32"
+    monkeypatch.setitem(sys.modules, "numpy", fake_np)
+    monkeypatch.setattr(stt.WhisperSTT, "_model", None)
+
+    voice = stt.WhisperSTT(model_size="tiny.en")
+    await voice.start()
+    assert voice._model is not None
+
+    # Under ~0.5s is a cough, dropped rather than sent to the model.
+    await voice.send(b"\x00\x00" * 100)
+    await voice.endpoint()
+    assert voice.events.empty(), "a short blip should not reach the model"
+
+    await voice.send(b"\x00\x00" * SAMPLE_RATE)
+    await voice.endpoint()
+    event = await asyncio.wait_for(voice.events.get(), timeout=2)
+    assert event == {"type": "final", "text": "hello there", "ended": True}
+
+    await voice.close()
+
+
 def real_deepgram_key() -> str:
     """conftest scrubs the provider keys; the live tests want the real one."""
     from dotenv import dotenv_values
@@ -1481,6 +1569,43 @@ def test_erase_removes_one_caller_and_leaves_the_others(client, monkeypatch):
     leftover = json.loads((tools.DATA_DIR / "leads.json").read_text(encoding="utf-8"))
     assert all(row["email"] != "erase-me@acme.io" for row in leftover)
     assert any(row["email"] == "keep-me@acme.io" for row in leftover)
+
+
+def test_export_returns_one_caller_and_leaves_the_others_out(client, monkeypatch):
+    """GET /data is the access-right counterpart to DELETE /data - same gate,
+    same lookup, a read instead of a delete. Erasure alone let an operator
+    take a caller's data away without ever being able to show them what it was."""
+    monkeypatch.setattr(main_mod, "AUTH_TOKEN", "s3cret")
+    mine = seed_caller("read-me@acme.io")
+    seed_caller("not-me@acme.io")
+
+    r = client.request("GET", "/data", params={"email": "read-me@acme.io"},
+                       headers={"authorization": "Bearer s3cret"})
+    assert r.status_code == 200, r.text
+    data = r.json()["data"]
+    assert len(data["leads"]) >= 1 and all(row["email"] == "read-me@acme.io" for row in data["leads"])
+    assert len(data["bookings"]) == 1 and data["bookings"][0]["email"] == "read-me@acme.io"
+    assert [c["session_id"] for c in data["calls"]] == [mine]
+
+    # Nothing was deleted - the leftover file still has both callers.
+    leftover = json.loads((tools.DATA_DIR / "leads.json").read_text(encoding="utf-8"))
+    assert any(row["email"] == "not-me@acme.io" for row in leftover)
+
+
+def test_export_needs_the_token_and_refuses_when_none_is_configured(client, monkeypatch):
+    monkeypatch.setattr(main_mod, "AUTH_TOKEN", "")
+    assert client.request("GET", "/data", params={"email": "x@acme.io"}).status_code == 503
+    monkeypatch.setattr(main_mod, "AUTH_TOKEN", "s3cret")
+    assert client.request("GET", "/data", params={"email": "x@acme.io"}).status_code == 401
+    assert client.request("GET", "/data", params={"email": "x@acme.io"},
+                          headers={"authorization": "Bearer wrong"}).status_code == 401
+
+
+def test_the_model_cannot_reach_the_export_function():
+    assert "export_caller" not in tools.REGISTRY
+    assert not any(schema["name"] == "export_caller" for schema in tools.SCHEMAS)
+    assert tools.call("export_caller", {"email": "victim@acme.io"})["error"] == "unknown_tool"
+
 
 def qualified(email: str) -> dict:
     """A check_lead_qualification result, which is what puts an address into
@@ -1770,6 +1895,19 @@ def test_erasure_reaches_inside_a_sealed_record(client, monkeypatch, sealed):
     assert r.json()["removed"]["calls"] == 1
     assert not (session_mod.CALLS_DIR / f"{mine}.json").exists()
     assert (session_mod.CALLS_DIR / f"{theirs}.json").exists(), "erased the wrong caller"
+
+
+def test_export_reaches_inside_a_sealed_record(client, monkeypatch, sealed):
+    monkeypatch.setattr(main_mod, "AUTH_TOKEN", "s3cret")
+    mine = seed_caller("sealed-read@acme.io")
+    seed_caller("sealed-other@acme.io")
+
+    r = client.request("GET", "/data", params={"email": "sealed-read@acme.io"},
+                       headers={"authorization": "Bearer s3cret"})
+
+    data = r.json()["data"]
+    assert [c["session_id"] for c in data["calls"]] == [mine]
+    assert data["leads"][0]["email"] == "sealed-read@acme.io"
 
 
 def test_erasure_reports_the_records_it_could_not_open(client, monkeypatch):
@@ -2300,6 +2438,26 @@ def test_postgres_stores_a_lead_and_erases_it(pg_store):
     assert pg_store.erase("cto@acme.io") == {"leads": 1, "bookings": 0}
     with pg_store.pool.connection() as conn:
         assert conn.execute("SELECT count(*) FROM leads").fetchone()[0] == 0
+
+
+def test_postgres_exports_a_lead_and_a_booking(pg_store):
+    """The access-right counterpart to erase: same lookup, contact unsealed
+    back out instead of the row being dropped."""
+    lead = {
+        "email": "cfo@acme.io", "domain": "acme.io", "company_size": 80,
+        "score": 45, "tier": "warm", "reasons": ["business email domain"],
+        "qualified": True, "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+    pg_store.add_lead(lead)
+    pg_store.book(booking("cfo@acme.io", slot()), 30, 3)
+
+    data = pg_store.export("cfo@acme.io")
+    assert len(data["leads"]) == 1 and data["leads"][0]["email"] == "cfo@acme.io"
+    assert data["leads"][0]["tier"] == "warm"
+    assert len(data["bookings"]) == 1 and data["bookings"][0]["email"] == "cfo@acme.io"
+
+    # Nothing was removed - it is still there for erase() to find afterwards.
+    assert pg_store.erase("cfo@acme.io") == {"leads": 1, "bookings": 1}
 
 
 def test_postgres_refuses_an_overlapping_slot(pg_store):

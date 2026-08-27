@@ -37,7 +37,9 @@ jobs:
         working-directory: server
         # No provider keys here, and none needed: conftest blanks them, the
         # live tests skip themselves, and pgserver brings its own PostgreSQL.
-        run: pytest -q
+        # --cov-fail-under is a floor, not a target: it catches a feature that
+        # shipped with no test at all, not a demand that every branch is hit.
+        run: pytest -q --cov=. --cov-report=term-missing --cov-fail-under=80
 
   # The deploy is the part of a repo that rots without anyone noticing: no other
   # job here fails if the Dockerfile stops building, or if the page comes up

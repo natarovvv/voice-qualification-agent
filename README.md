@@ -651,6 +651,33 @@ happens: only the *next* one reaches the caller, on the socket that healed.
 A single address opening `MAX_CALLS_PER_IP` sockets gets the same 1013 the
 whole process hands out when `MAX_CALLS` itself is spent — same rejection
 path, same metric, a different reason label to tell them apart.
+`TRUST_PROXY_HEADERS` gets two more: `X-Forwarded-For` is ignored by default
+even when it is present, and once the setting is on, two sockets claiming the
+same forwarded address hit the cap while a third claiming a different one
+does not — proving the header is read only when asked for, and keyed on
+correctly once it is.
+
+`GET /data` is the access-right counterpart to `DELETE /data` and is tested
+the same way: one caller's leads, bookings and call records come back and a
+second caller's do not, the request is refused without `AUTH_TOKEN` and with
+a wrong one, the model cannot reach `export_caller` any more than it can
+reach `erase_caller`, and it reaches inside a sealed record the same as
+erasure does — proving the read side, not just the delete side, survives
+`CALL_ENCRYPTION_KEY` being set. Postgres gets its own test for the same
+thing: `contact` comes back unsealed rather than as ciphertext, and nothing
+is removed — `erase` on the same address afterwards still finds the row.
+
+`WhisperSTT`, the local fallback used only when there is no
+`DEEPGRAM_API_KEY`, never ran once in the rest of the suite — every other
+test's environment has a key. One test fakes `faster_whisper` and `numpy`
+in `sys.modules` (neither is in `requirements.lock`; the real packages pull
+torch) and drives it directly: a short blip under the 0.5 s floor is dropped
+without reaching the model, and a longer one comes back as a `final` event
+with the transcribed text.
+
+CI now runs `pytest --cov-fail-under=80`. The floor is well under the
+project's actual ~86%, on purpose — it is there to catch a feature that
+shipped with no test at all, not to chase every branch.
 
 ## Security
 
@@ -672,7 +699,11 @@ off unless `DEV=1`. Before it listens anywhere else:
   `MAX_CALLS` sockets for the whole process. None of those bound one *caller*,
   so `MAX_CALLS_PER_IP` (default 3) does: past it, that address gets the same
   1013 the whole process gives out when it is full, instead of a free hand to
-  take every slot for itself.
+  take every slot for itself. It reads the TCP peer by default, which is a
+  reverse proxy's own address once there is one in front of this — set
+  `TRUST_PROXY_HEADERS=true` to read `X-Forwarded-For` instead, and only
+  behind a proxy that overwrites that header rather than passing a caller's
+  own value through untouched.
 
 Data and third parties, which are decisions rather than settings:
 
@@ -800,6 +831,16 @@ Data and third parties, which are decisions rather than settings:
   What none of this covers is a caller who gives their address *after* the
   request has been served: that is data collected afterwards, and it is a new
   record rather than a surviving one.
+- **Access requests:** `GET /data?email=...` with the same `Authorization:
+  Bearer $AUTH_TOKEN` gate as erasure returns that caller's leads, bookings
+  and call records instead of deleting them — the read half of the same
+  right, so a caller can be told what is held about them without that request
+  also being the one that throws it away. Same refusal shape, same reasoning
+  for keeping it out of `SCHEMAS`: an access tool the model could call would
+  let a caller read someone else's record by naming their address. Sealed
+  rows come back unsealed rather than as ciphertext nobody asked for, and a
+  record this process cannot open is counted rather than silently skipped,
+  the same way erasure counts what it could not reach.
 
 ## Known corners
 
@@ -846,9 +887,10 @@ Data and third parties, which are decisions rather than settings:
   call silent for good, same as before this existed. It is sized for a blip,
   not a sustained failure — a retry loop with backoff is the upgrade if that
   turns out to matter.
-- `MAX_CALLS_PER_IP` reads `ws.client.host` directly. Behind a reverse proxy
-  every caller shares that one address unless the proxy is configured to pass
-  the real one through and something here is made to trust it.
+- `MAX_CALLS_PER_IP` trusts `X-Forwarded-For` only when `TRUST_PROXY_HEADERS`
+  is on, and even then reads only the first hop — correct behind one reverse
+  proxy that overwrites the header, wrong behind a chain of them where a
+  caller's own forged value survives to the first hop the app sees.
 - The session copy in Redis is not sealed. It holds the live transcript for
   `SESSION_TTL` (30 minutes) so a dropped call can resume, and Redis is
   normally memory-only; the 30-day copy on disk is the one worth a key. Turn
