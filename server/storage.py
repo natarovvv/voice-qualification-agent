@@ -191,6 +191,13 @@ class JsonStore:
                     self._save(name, kept)
         return removed
 
+    def export(self, email: str) -> dict:
+        with self._lock:
+            return {
+                name: [r for r in self._load(name) if str(r.get("email", "")).lower() == email]
+                for name in ("leads", "bookings")
+            }
+
 
 class PostgresStore:
     """The same two collections, where a second worker cannot corrupt them."""
@@ -325,6 +332,35 @@ class PostgresStore:
                 )
                 removed[table] = cur.rowcount
         return removed
+
+    def export(self, email: str) -> dict:
+        """The access-right counterpart to erase: same lookup, a read instead
+        of a delete. contact is sealed on disk, so it comes back unsealed
+        here rather than as ciphertext nobody asked for."""
+        self.ensure_schema()
+        lookups = blind(email) + [(email or "").strip().lower()]
+        out = {}
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                "SELECT contact, company_size, score, tier, reasons, qualified, checked_at"
+                " FROM leads WHERE lower(email) = ANY(%s)", (lookups,)
+            ).fetchall()
+            out["leads"] = [
+                {**unseal(contact, "leads.contact"), "company_size": size, "score": score,
+                 "tier": tier, "reasons": reasons, "qualified": qualified,
+                 "checked_at": checked_at.isoformat()}
+                for contact, size, score, tier, reasons, qualified, checked_at in rows
+            ]
+            rows = conn.execute(
+                "SELECT contact, start_at, end_at, booked_at FROM bookings"
+                " WHERE lower(email) = ANY(%s)", (lookups,)
+            ).fetchall()
+            out["bookings"] = [
+                {**unseal(contact, "bookings.contact"), "start": start.isoformat(),
+                 "end": end.isoformat(), "booked_at": booked_at.isoformat()}
+                for contact, start, end, booked_at in rows
+            ]
+        return out
 
 
 def make_storage() -> Any:

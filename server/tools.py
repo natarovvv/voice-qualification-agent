@@ -228,6 +228,30 @@ def erase_caller(email: str) -> dict:
     return {"ok": True, "email": email, "removed": removed}
 
 
+def export_caller(email: str) -> dict:
+    """Everything held about one caller, keyed by email - the access-right
+    counterpart to erase_caller. Same not-in-SCHEMAS reasoning: the model
+    must never be able to fetch someone else's record by claiming their email.
+    """
+    email = (email or "").strip().lower()
+    if not EMAIL_RE.match(email):
+        return {"ok": False, "error": "invalid_email"}
+
+    data = STORAGE.export(email)
+    data["calls"] = []
+    unreadable = 0
+    for f in CALLS_DIR.glob("*.json"):
+        try:
+            rec = read_record(f)
+        except Unreadable as exc:
+            log.warning("export could not read %s", exc)
+            unreadable += 1
+            continue
+        if email in addresses(rec.get("lead")):
+            data["calls"].append(rec)
+    return {"ok": True, "email": email, "data": data, "unreadable": unreadable}
+
+
 # Words that match everything and therefore mean nothing. Without these,
 # "do you sell bicycles" scores a hit on every article containing "you".
 STOPWORDS = frozenset(

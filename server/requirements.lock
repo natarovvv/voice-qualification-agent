@@ -16,6 +16,7 @@ certifi==2026.7.22
 cffi==2.1.1
 click==8.4.2
 colorama==0.4.6
+coverage==7.15.4
 cryptography==49.0.0
 edge-tts==7.2.8
 fakeredis==2.37.1
@@ -44,6 +45,7 @@ pydantic_core==2.46.4
 Pygments==2.21.0
 pytest==9.1.1
 pytest-asyncio==1.4.0
+pytest-cov==7.1.0
 python-dotenv==1.2.3
 PyYAML==6.0.3
 redis==8.1.0
