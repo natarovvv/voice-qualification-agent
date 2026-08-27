@@ -40,9 +40,24 @@ STREAM_TIMEOUT = httpx.Timeout(LLM_STREAM_TIMEOUT, connect=5.0)
 ToolSink = Callable[[str, dict, dict], Awaitable[None]]
 
 
-async def _run_tools(calls: list[dict], on_tool: ToolSink | None) -> list[dict]:
+async def _run_tools(calls: list[dict], on_tool: ToolSink | None, asked_this_turn: set[str]) -> list[dict]:
+    """Run the model's tool calls. `asked_this_turn` is one caller turn's
+    worth of state, created fresh by the caller and threaded through every
+    tool round of that turn - see the confirmed=true guard below.
+    """
     out = []
     for c in calls:
+        args = c.get("args") or {}
+        if c["name"] == "check_lead_qualification":
+            email = str(args.get("email", "")).strip().lower()
+            if args.get("confirmed") and email in asked_this_turn:
+                # The model saw its own needs_confirmation this same turn and
+                # tried to answer for the caller instead of waiting for them -
+                # the tool-round loop lets it chain calls with nobody's "yes"
+                # in between. Send it back to ask again, for real this time.
+                c = {**c, "args": {**args, "confirmed": False}}
+            elif not args.get("confirmed"):
+                asked_this_turn.add(email)
         # to_thread: the storage backend may be a real database, and a
         # blocking round trip on the event loop would stall every other call.
         result = await asyncio.to_thread(tools.call, c["name"], c.get("args") or {})
@@ -72,6 +87,7 @@ class GeminiLLM:
 
     async def stream(self, system: str, history: list[dict], on_tool: ToolSink | None = None) -> AsyncIterator[str]:
         contents = self._contents(history)
+        asked_this_turn: set[str] = set()
         for _ in range(MAX_TOOL_ROUNDS):
             body = {
                 "systemInstruction": {"parts": [{"text": system}]},
@@ -110,7 +126,7 @@ class GeminiLLM:
                     "role": "user",
                     "parts": [
                         {"functionResponse": {"name": c["name"], "response": c["result"]}}
-                        for c in await _run_tools(pending, on_tool)
+                        for c in await _run_tools(pending, on_tool, asked_this_turn)
                     ],
                 }
             )
@@ -142,6 +158,7 @@ class GroqLLM:
     async def stream(self, system: str, history: list[dict], on_tool: ToolSink | None = None) -> AsyncIterator[str]:
         messages = [{"role": "system", "content": system}, *history]
         specs = [{"type": "function", "function": s} for s in tools.SCHEMAS]
+        asked_this_turn: set[str] = set()
         for _ in range(MAX_TOOL_ROUNDS):
             body = {
                 "model": self.model,
@@ -196,7 +213,7 @@ class GroqLLM:
                     ],
                 }
             )
-            for c in await _run_tools(pending, on_tool):
+            for c in await _run_tools(pending, on_tool, asked_this_turn):
                 messages.append(
                     {"role": "tool", "tool_call_id": c["id"], "content": json.dumps(c["result"])}
                 )
@@ -224,7 +241,11 @@ class OfflineLLM:
         size = tools.parse_company_size(last)
 
         if email and size:
-            (call,) = await _run_tools([{"name": "check_lead_qualification", "args": {"email": email, "company_size": size}}], on_tool)
+            # Offline mode is a canned demo, not a conversation - it has no
+            # turn in which to read the address back, so it skips straight
+            # to the confirmed call a real dialogue reaches on its second.
+            args = {"email": email, "company_size": size, "confirmed": True}
+            (call,) = await _run_tools([{"name": "check_lead_qualification", "args": args}], on_tool, set())
             r = call["result"]
             if r.get("qualified"):
                 yield f"Thanks. You are a {r['tier']} fit. Shall I book you a call with a specialist?"
@@ -232,7 +253,7 @@ class OfflineLLM:
                 yield "Thanks, I have that noted. I will send you our self-serve guide instead."
             return
 
-        hit = (await _run_tools([{"name": "lookup_kb", "args": {"query": last}}], on_tool))[0]["result"]
+        hit = (await _run_tools([{"name": "lookup_kb", "args": {"query": last}}], on_tool, set()))[0]["result"]
         if hit.get("found"):
             yield hit["results"][0]["body"]
             yield " What is your work email and how many people are at your company?"

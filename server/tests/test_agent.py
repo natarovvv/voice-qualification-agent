@@ -56,11 +56,32 @@ def next_weekday_slot(hour: int = 10, days_ahead: int = 1) -> str:
 
 
 def test_qualification_scores_business_domain_and_size():
-    hot = tools.check_lead_qualification("cto@acme-corp.io", "800")
-    cold = tools.check_lead_qualification("me@gmail.com", "3")
+    hot = tools.check_lead_qualification("cto@acme-corp.io", "800", confirmed=True)
+    cold = tools.check_lead_qualification("me@gmail.com", "3", confirmed=True)
     assert hot["tier"] == "hot" and hot["qualified"]
     assert cold["tier"] == "cold" and not cold["qualified"]
     assert hot["score"] > cold["score"]
+
+
+def test_qualification_asks_for_confirmation_before_writing_anything():
+    """A transcriber can mishear a spelled-out address, so the first call
+    only hands back what it heard - it must not be the call that persists."""
+    first = tools.check_lead_qualification("cto@acmycorp.io", "600")
+    assert first == {
+        "ok": False,
+        "error": "needs_confirmation",
+        "message": (
+            "Read 'cto@acmycorp.io' and '600 employees' back to the caller. "
+            "Once they confirm, call this again with confirmed=true."
+        ),
+        "email": "cto@acmycorp.io",
+        "company_size": 600,
+    }
+    assert all(row["email"] != "cto@acmycorp.io" for row in storage.STORAGE._load("leads"))
+
+    second = tools.check_lead_qualification("cto@acmycorp.io", "600", confirmed=True)
+    assert second["ok"] and second["tier"] == "hot"
+    assert storage.STORAGE._load("leads")[-1]["email"] == "cto@acmycorp.io"
 
 
 def test_qualification_parses_messy_company_size():
@@ -314,7 +335,7 @@ def test_call_record_is_saved_with_lead_and_transcript():
     s.add_tool_call(
         "check_lead_qualification",
         {"email": "cto@acme.io", "company_size": "600"},
-        tools.check_lead_qualification("cto@acme.io", "600"),
+        tools.check_lead_qualification("cto@acme.io", "600", confirmed=True),
     )
     s.add_turn("assistant", "You are a great fit.")
     rec = s.save({"intent": "demo request"})
@@ -970,6 +991,46 @@ async def test_a_streamed_reply_has_a_shorter_deadline_than_the_summary():
     assert streamed["read"] < summary["read"]
 
 
+async def test_a_model_cannot_confirm_a_lead_without_the_caller_in_between():
+    """The tool-round loop lets a model chain several tool calls while
+    answering one caller turn - so a model that sees its own
+    needs_confirmation could just call again with confirmed=true straight
+    away, self-approving an address nobody on the line actually confirmed.
+    That must not work: only a *later* turn may confirm."""
+    rounds = [
+        # round 1: the model asks, unconfirmed
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1",'
+        '"function":{"name":"check_lead_qualification",'
+        '"arguments":"{\\"email\\":\\"cto@confirm-guard.io\\",\\"company_size\\":\\"600\\"}"}}]}}]}\n\n'
+        "data: [DONE]\n\n",
+        # round 2: same turn, no caller input in between - tries to self-confirm
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c2",'
+        '"function":{"name":"check_lead_qualification",'
+        '"arguments":"{\\"email\\":\\"cto@confirm-guard.io\\",\\"company_size\\":\\"600\\",'
+        '\\"confirmed\\":true}"}}]}}]}\n\n'
+        "data: [DONE]\n\n",
+        # round 3: gives up on tools, replies in words
+        'data: {"choices":[{"delta":{"content":"Okay."}}]}\n\ndata: [DONE]\n\n',
+    ]
+    calls = iter(rounds)
+
+    async def record(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=next(calls))
+
+    seen = []
+
+    async def on_tool(name, args, result):
+        seen.append((args, result))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(record)) as http:
+        provider = llm.GroqLLM(http, "key")
+        assert await spoken(provider, on_tool) == ["Okay."]
+
+    assert [r["error"] for _, r in seen] == ["needs_confirmation", "needs_confirmation"]
+    assert seen[1][0]["confirmed"] is False, "the self-confirm attempt must be downgraded, not honoured"
+    assert all(row["email"] != "cto@confirm-guard.io" for row in storage.STORAGE._load("leads"))
+
+
 def test_the_chain_is_built_from_the_keys_that_are_set(monkeypatch):
     monkeypatch.setattr(llm, "GROQ_API_KEY", "g")
     monkeypatch.setattr(llm, "GEMINI_API_KEY", "")
@@ -1209,7 +1270,7 @@ def test_interrupt_does_not_propagate_a_failed_turn(monkeypatch):
 
 
 def seed_caller(email: str) -> str:
-    tools.check_lead_qualification(email, "600")
+    tools.check_lead_qualification(email, "600", confirmed=True)
     slot = (datetime.now(timezone.utc) + timedelta(days=3)).replace(
         hour=10, minute=0, second=0, microsecond=0
     )
@@ -1220,7 +1281,7 @@ def seed_caller(email: str) -> str:
     s.add_turn("user", "please delete my data afterwards")
     s.add_tool_call(
         "check_lead_qualification", {"email": email, "company_size": "600"},
-        tools.check_lead_qualification(email, "600"),
+        tools.check_lead_qualification(email, "600", confirmed=True),
     )
     s.save({})
     return s.id
@@ -1246,7 +1307,7 @@ def test_erase_removes_one_caller_and_leaves_the_others(client, monkeypatch):
 def qualified(email: str) -> dict:
     """A check_lead_qualification result, which is what puts an address into
     a session's facts - the only place a live call is filed under a name."""
-    return tools.check_lead_qualification(email, "600")
+    return tools.check_lead_qualification(email, "600", confirmed=True)
 
 
 async def test_erasing_a_session_leaves_nothing_to_resume_it_from():
@@ -1574,7 +1635,7 @@ def test_no_key_means_the_records_are_written_the_way_they_always_were(monkeypat
     assert session_mod.seal(record) is record
 
 def test_a_lead_never_reaches_the_disk_in_the_clear_either(sealed, tmp_path):
-    tools.check_lead_qualification("cfo@acme-corp.io", "600")
+    tools.check_lead_qualification("cfo@acme-corp.io", "600", confirmed=True)
 
     raw = (tmp_path / "leads.json").read_text(encoding="utf-8")
     assert "cfo@acme-corp.io" not in raw
@@ -1588,7 +1649,7 @@ def test_a_plain_lead_file_seals_itself_on_the_next_write(sealed, tmp_path):
     touched again, so the old ones simply stay plain and stay readable."""
     session_mod.write_json(tmp_path / "leads.json", [{"email": "already@acme-corp.io"}])
 
-    tools.check_lead_qualification("new@acme-corp.io", "600")
+    tools.check_lead_qualification("new@acme-corp.io", "600", confirmed=True)
 
     raw = (tmp_path / "leads.json").read_text(encoding="utf-8")
     assert json.loads(raw)["enc"] == "fernet"
@@ -1613,12 +1674,13 @@ def test_a_lead_file_under_a_key_we_do_not_have_is_not_overwritten(sealed, tmp_p
     """Reading a sealed file back as "no rows" would let the next write drop
     everything in it. A tool failure the agent can talk about is the right
     outcome; a file quietly emptied by a key rotation gone wrong is not."""
-    tools.check_lead_qualification("first@acme-corp.io", "600")
+    tools.check_lead_qualification("first@acme-corp.io", "600", confirmed=True)
     before = (tmp_path / "leads.json").read_bytes()
 
     monkeypatch.setattr(session_mod, "CIPHER", cipher_for(new_key()))
     result = tools.call(
-        "check_lead_qualification", {"email": "second@acme-corp.io", "company_size": "600"}
+        "check_lead_qualification",
+        {"email": "second@acme-corp.io", "company_size": "600", "confirmed": True},
     )
 
     assert not result["ok"] and result["error"] == "tool_failed"
@@ -1626,8 +1688,8 @@ def test_a_lead_file_under_a_key_we_do_not_have_is_not_overwritten(sealed, tmp_p
 
 
 def test_erasure_reaches_a_sealed_lead_and_seals_what_is_left(sealed, tmp_path):
-    tools.check_lead_qualification("gone@acme-corp.io", "600")
-    tools.check_lead_qualification("stays@acme-corp.io", "600")
+    tools.check_lead_qualification("gone@acme-corp.io", "600", confirmed=True)
+    tools.check_lead_qualification("stays@acme-corp.io", "600", confirmed=True)
 
     removed = storage.STORAGE.erase("gone@acme-corp.io")
 
@@ -2173,7 +2235,7 @@ def test_the_tools_run_against_postgres(pg_store, monkeypatch):
     """The tools themselves, not just the store underneath them."""
     monkeypatch.setattr(tools, "STORAGE", pg_store)
 
-    qualified = tools.check_lead_qualification("cfo@bigco.com", "900")
+    qualified = tools.check_lead_qualification("cfo@bigco.com", "900", confirmed=True)
     assert qualified["ok"] and qualified["tier"] == "hot"
 
     when = slot(days_ahead=5)
