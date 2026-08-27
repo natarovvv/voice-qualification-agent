@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from config import DATA_DIR
-from session import CALLS_DIR, Unreadable, read_record
+from session import CALLS_DIR, Unreadable, addresses, read_record
 from storage import STORAGE
 
 log = logging.getLogger(__name__)
@@ -190,10 +190,7 @@ def erase_caller(email: str) -> dict:
             log.warning("erasure could not read %s", exc)
             removed["unreadable"] += 1
             continue
-        lead = rec.get("lead") or {}
-        addresses = {str(lead.get("email", "")).lower(),
-                     str((lead.get("booking") or {}).get("email", "")).lower()}
-        if email in addresses:
+        if email in addresses(rec.get("lead")):
             f.unlink(missing_ok=True)
             removed["calls"] += 1
     return {"ok": True, "email": email, "removed": removed}

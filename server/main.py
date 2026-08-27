@@ -18,7 +18,7 @@ import time
 from contextlib import asynccontextmanager, suppress
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 
@@ -154,6 +154,39 @@ async def health() -> dict:
     return {"ok": True}
 
 
+# A dependency that has stopped answering is not going to answer in a moment,
+# and a readiness probe that hangs is one that never says no.
+READY_TIMEOUT = 3.0
+
+
+@app.get("/ready")
+async def ready(response: Response) -> dict:
+    """Whether this worker can do the job, as opposed to merely being alive.
+
+    /health answers "the process is running", which is the right question for
+    a restart and the wrong one for a load balancer: a worker whose Postgres
+    is unreachable answers it cheerfully and then fails every booking it is
+    handed. So the things it depends on get asked, and a 503 takes this worker
+    out of rotation without killing a process that has nothing wrong with it.
+
+    Open, like /health, because whatever is polling this has no token: it says
+    which dependency is unhappy and nothing about where it lives or why. The
+    exception type, never its message - a connection error carries the DSN.
+    """
+    checks = {}
+    for name, probe in (("storage", lambda: asyncio.to_thread(storage.STORAGE.ping)),
+                        ("sessions", STORE.ping)):
+        try:
+            await asyncio.wait_for(probe(), READY_TIMEOUT)
+            checks[name] = "ok"
+        except Exception as exc:  # noqa: BLE001 - whatever it is, we are not ready
+            checks[name] = type(exc).__name__
+            log.warning("not ready: %s is not answering: %s", name, exc)
+    ok = all(v == "ok" for v in checks.values())
+    response.status_code = 200 if ok else 503
+    return {"ok": ok, **checks}
+
+
 def bearer_ok(request: Request) -> bool:
     supplied = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
     return secrets.compare_digest(supplied, AUTH_TOKEN)
@@ -187,9 +220,15 @@ async def erase(email: str, request: Request) -> dict:
     if not bearer_ok(request):
         raise HTTPException(401, "bad token")
 
+    # Sessions first, and the order is the whole trick: a call still in flight
+    # holds its transcript in the store and writes it out when it ends, so
+    # sweeping the files first would leave it to write itself back afterwards.
+    # Erasing the session marks it ended, and an ended call writes nothing.
+    sessions = await STORE.erase((email or "").strip().lower())
     result = await asyncio.to_thread(tools.erase_caller, email)
     if not result["ok"]:
         raise HTTPException(400, result["error"])
+    result["removed"]["sessions"] = sessions
     # The address is the thing being erased, so it does not go in the log.
     log.info("erasure request completed: %s", result["removed"])
     return result
@@ -400,6 +439,14 @@ class Call:
     async def finalize(self) -> dict | None:
         """End the call for good: summarize it, write the record, let it go."""
         if self.session.ended or not self.session.transcript:
+            return None
+        if await STORE.erased(self.session.facts):
+            # Erased on another worker while this call was still going. The
+            # sweep could not reach this copy - it belongs to this process -
+            # so the note it left is read here, before anything is written.
+            log.info("call %s was erased while it was live; writing nothing", self.session.id)
+            await STORE.drop(self.session.id)
+            self.session.ended = True
             return None
         summary = await llm_mod.summarize(self.llm, self.session.transcript, self.session.facts)
         record = self.session.save(summary)
