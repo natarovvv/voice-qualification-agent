@@ -48,7 +48,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: docker compose up -d --build --wait
-      - run: curl -fsS http://localhost:8000/health
+      # --wait already blocked on the container's healthcheck, which is /ready,
+      # so this asserts the half that matters: it reached both backing stores.
+      - run: curl -fsS http://localhost:8000/ready | grep -q '"storage":"ok","sessions":"ok"'
       - run: curl -fsS http://localhost:3000 | grep -q "Start call"
       - name: server log
         if: always()

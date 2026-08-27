@@ -16,6 +16,63 @@ browser mic ─ AudioWorklet ─► PCM16 16k ─ websocket ─► VAD ─► ST
         speaker ◄─ scheduled AudioBuffers ◄─ PCM16 ◄─ TTS ◄─ LLM + tools
 ```
 
+## A real call
+
+Spoken end to end against `docker compose up` — Deepgram transcribing, Groq
+answering, Aura speaking, the booking landing in Postgres. Nothing typed and
+nothing edited; the caller is a synthesised voice streamed in as microphone
+PCM, because a README cannot hold a microphone. The `->` lines are the record's
+tool log, put back where each call happened.
+
+```
+ agent: Hi, you have reached support. I am Aria. What can I help you with today?
+caller: Hi there.
+caller: How much does your platform cost?
+        -> lookup_kb("pricing") -> found: Pricing
+ agent: Our plans are Starter at $49 per seat per month, Growth at $89, and
+        Enterprise is custom priced. Which plan are you interested in?
+caller: It cto@acmycorp.io.
+caller: We are about 600 people.
+        -> check_lead_qualification("cto@acmycorp.io", 600) -> hot, score 80
+ agent: Great, would you like to schedule a 30-minute call with a specialist?
+        If so, what date and time (UTC) work best for you?
+caller: Tomorrow at ten in the morning works for me.
+        -> book_calendar_slot("2026-08-28 10:00") -> Friday 28 August at 10:00 UTC
+ agent: Your call is booked for Friday 28 August at 10:00 UTC. Anything else
+        I can help with?
+```
+
+The caller said "my work email is c t o at acme corp dot io" and Deepgram
+heard `cto@acmycorp.io`. That is what a real transcriber does with a spelled
+address, and it is left in rather than tidied up — the agent is told to read
+an address back before using it, which is the part of the design that answers
+this, and on this call the caller did not correct it.
+
+The record written at hangup, minus the transcript and the tool log above:
+
+```json
+{
+  "session_id": "MFHwJy2B8vXw0zBjB1yHYcA5",
+  "duration_sec": 50.6,
+  "lead": {
+    "email": "cto@acmycorp.io", "company_size": 600, "tier": "hot",
+    "score": 80, "qualified": true,
+    "booking": {"start": "2026-08-28T10:00:00+00:00", "email": "cto@acmycorp.io"}
+  },
+  "summary": {
+    "intent": "Pricing inquiry and schedule call",
+    "summary": "Caller asked about platform pricing, provided company size of 600, and scheduled a 30-minute specialist call for 28 August 2026 at 10:00 UTC.",
+    "qualified": true,
+    "next_action": "Prepare for specialist call",
+    "sentiment": "neutral"
+  }
+}
+```
+
+With `CALL_ENCRYPTION_KEY` set that file is a Fernet token and the session id;
+the lead row in Postgres keeps an HMAC of the address in place of the address.
+See [Security](#security).
+
 ## Layout
 
 | Path | What it is |
@@ -169,6 +226,12 @@ on another worker still wins that race, because the hold is what decides.
 sockets, and how long the records get after that — and compose gives the
 container 30 s before the kill, which is both halves and room.
 
+`--wait` and `depends_on: service_healthy` wait on the server's own
+HEALTHCHECK, which is `/ready` — so "the stack is up" means the server reached
+Postgres and Redis, not merely that a process is listening. A worker whose
+database goes away later stops being ready and stays alive; see
+[Observability](#observability) for why those are two different questions.
+
 `server/data` is a named volume, so call records survive `docker compose down`
 and `kb.json` is seeded into it from the image on the first run. Postgres keeps
 its own. `docker compose down -v` is the one that throws both away.
@@ -274,6 +337,41 @@ below. `test_typed_turn_latency_under_budget` asserts the orchestration
 overhead alone stays under budget with providers mocked.
 
 ## Observability
+
+`GET /health` answers whether the process is running. `GET /ready` answers
+whether it can do the job: it asks the two things a worker cannot work
+without — the leads and bookings store, and the session store — and answers
+503 naming
+whichever one is not answering.
+
+```
+$ curl -s localhost:8000/ready
+{"ok":true,"storage":"ok","sessions":"ok"}
+
+$ docker compose stop postgres && curl -s localhost:8000/ready
+{"ok":false,"storage":"AdminShutdown","sessions":"ok"}     # 503
+
+$ curl -s localhost:8000/health
+{"ok":true}                                                # 200, still
+```
+
+The two questions have different answers on purpose. Restarting a worker
+because its database went away replaces one that would have recovered with one
+that has to start from nothing, and drops every call on it on the way — so
+`/health` stays yes, and it is the load balancer rather than the supervisor
+that acts on the no. The container HEALTHCHECK is `/ready`, which is what
+`docker compose up --wait` and `depends_on: service_healthy` are waiting for.
+
+It is answered without a token, because whatever polls it does not have one.
+So it names the dependency and the exception type and nothing more — a
+connection error's own message carries the DSN. A probe that hangs never gets
+to say no, so each dependency has three seconds to answer.
+
+Readiness is per worker. With `WORKERS=2` a curl reaches whichever one
+answered, which is the right granularity for taking a single worker out of
+rotation and a confusing one to refresh by hand: for a few seconds after
+Postgres comes back one worker can still be holding a dead connection while
+the other is fine, and the answer alternates. Both answers are true.
 
 `GET /metrics` returns Prometheus text: how busy the box is, how many turns it
 answered, how many of those failed, which tools were called, how often one LLM
@@ -430,7 +528,12 @@ booking that deadlocks now asks again instead of handing the caller a
 traceback where the word `slot_taken` belongs. It wrote nothing and the winner
 has committed by the time it comes back, which makes the second answer the
 ordinary one. Two tests: a deadlock that clears on the retry, and one that
-never clears and is eventually allowed to fail.
+never clears and is eventually allowed to fail. The retry waits a random beat
+first, which is the difference between a fix and a slower way to fail the same
+way: everyone postgres just shot is holding the same question, and six of them
+asking it again in the same instant deadlock again. Without the wait those six
+racers spend all three attempts colliding, which is how this turned up — as a
+test that failed only when the machine was busy enough.
 Sealing it adds six tests and nine more mutations, all caught: that neither
 the address nor its domain appears in any column of any row — `to_jsonb(t)`
 takes the whole row, so a column added later is searched without anyone
@@ -441,6 +544,28 @@ cap counts rows it cannot read while the overlap constraint, which never saw
 an address in the first place, still holds. The last one builds the old table
 by hand — `domain NOT NULL`, no `contact` — and checks that a sealed insert
 lands in it and that the plaintext row already there is still erasable.
+
+Erasure reaching a live call is seven tests and ten mutations, all caught: a
+handler that sweeps the files before the sessions, an erased call left able to
+write its record, a `put` that stores an ended session anyway — which is how
+the next turn of a call in flight puts it back — an erase that looks in Redis
+but not at the calls this worker is serving, one that looks at those and not in
+Redis, a session in both counted twice, a call erasable only by the address it
+was scored under rather than also the one it booked under, an erasure that
+leaves no note for the other workers, a call that never reads the note, and a
+note read under a key nothing writes. The one that proves the ordering hangs
+up in the middle of the request: the record is written between the two halves
+of the erasure, which the other order leaves behind. The one that proves the
+note does the work runs two stores against one Redis and finalizes the call on
+the worker the request never touched.
+
+Readiness is four tests and five mutations, all caught: an endpoint that
+answers 200 whatever it found, one that calls itself ready when a single
+dependency answered, one that repeats what the exception said — the DSN, in
+other words — one that waits however long a dead dependency takes, and a
+Postgres ping that trusts the flag `ensure_schema` set at startup instead of
+asking the database. `/health` is asserted to still answer 200 in the same
+test, because that difference is the entire point of having both.
 
 The retrofit that catches those rows up is seven tests and seven mutations,
 all caught: a lookup written under the last key instead of the first, a sealed
@@ -571,8 +696,8 @@ Data and third parties, which are decisions rather than settings:
   when one is set. Call volume and latency are not caller data, but they are a
   free read on how much traffic you carry and when you are struggling.
 - **Erasure requests:** `DELETE /data?email=...` with `Authorization: Bearer
-  $AUTH_TOKEN` deletes that caller's leads, bookings and call records and
-  reports what it removed. It is refused outright unless `AUTH_TOKEN` is set,
+  $AUTH_TOKEN` deletes that caller's leads, bookings, call records and live
+  sessions, and reports what it removed. It is refused outright unless `AUTH_TOKEN` is set,
   and the agent cannot reach it — an erase tool the model could call would let
   a caller delete someone else's records by naming their address. A call where
   the caller never gave an email has no key to match on; the retention window
@@ -580,7 +705,22 @@ Data and third parties, which are decisions rather than settings:
   deployment does not have — is counted in `removed["unreadable"]` rather than
   passed over quietly: a record nobody can read is a record nobody can prove
   was erased, and the operator answering the request needs to see the count is
-  short.
+  short. It reaches a call that is still happening, too, and that is why the
+  session store is swept first and the files and rows second: a live call
+  holds its transcript in the store and writes its record when it ends, so the
+  other order leaves it to write itself back a moment later, with nobody
+  looking again. An erased session is marked ended, which is the one thing
+  that stops the call from being stored or written at the end — the caller
+  stays on the line and the conversation finishes, and nothing of it is kept.
+  The count comes back as `removed["sessions"]` — the calls this worker could
+  reach. A call being served by another one is in another process, where no
+  sweep can touch it, so the erasure leaves a note in Redis under the same
+  blind index the rows use, and a call reads it before it writes anything: the
+  record is not written and the log says so. That call is not in the count,
+  because the worker answering the request has no way to know it exists.
+  What none of this covers is a caller who gives their address *after* the
+  request has been served: that is data collected afterwards, and it is a new
+  record rather than a surviving one.
 
 ## Known corners
 

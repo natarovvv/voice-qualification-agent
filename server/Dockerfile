@@ -29,9 +29,11 @@ EXPOSE 8000
 # so making the directory writable does not take the knowledge base away.
 VOLUME ["/app/data"]
 
-# urlopen raises on anything but a 2xx, which is exactly the exit code docker
-# is asking for. No curl in slim, and no reason to install one for this.
-HEALTHCHECK --interval=30s --timeout=3s --start-period=20s \
-    CMD python -c 'import urllib.request as u; u.urlopen("http://127.0.0.1:8000/health")'
+# /ready rather than /health: what compose and anything else waiting on this
+# container want to know is whether it can take a call, and a worker that
+# cannot reach its database cannot. urlopen raises on anything but a 2xx,
+# which is exactly the exit code docker is asking for. No curl in slim.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
+    CMD python -c 'import urllib.request as u; u.urlopen("http://127.0.0.1:8000/ready")'
 
 CMD ["python", "main.py"]

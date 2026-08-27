@@ -737,6 +737,64 @@ def test_the_scrape_is_behind_the_token_when_one_is_set(client, monkeypatch):
     allowed = client.get("/metrics", headers={"authorization": "Bearer s3cret"})
     assert allowed.status_code == 200 and "voice_calls_total" in allowed.text
 
+# ------------------------------------------------------------------ readiness
+
+
+class Sulking:
+    """A backing store that is there and not answering, which is the case."""
+
+    name = "sulking"
+    # The message carries a password and a host on purpose: an answer this
+    # endpoint gives to anyone who can reach the port must not repeat it.
+    exc = ConnectionError("connection to postgresql://voice:hunter2@db:5432 failed")
+
+    def ping(self) -> None:
+        raise self.exc
+
+
+def test_health_says_the_process_is_up_and_ready_says_it_can_take_a_call(client, monkeypatch):
+    """The two questions a probe can ask, and they have different answers.
+
+    Restarting a worker because its database is down replaces a worker that
+    would recover with one that has to start over, so /health stays yes.
+    """
+    assert client.get("/ready").json() == {"ok": True, "storage": "ok", "sessions": "ok"}
+
+    monkeypatch.setattr(storage, "STORAGE", Sulking())
+    assert client.get("/health").status_code == 200, "a dead database restarted the process"
+    refused = client.get("/ready")
+    assert refused.status_code == 503
+    assert refused.json() == {"ok": False, "storage": "ConnectionError", "sessions": "ok"}
+
+
+def test_readiness_names_the_dependency_and_not_where_it_lives(client, monkeypatch):
+    """It is answered without a token, so it says which one is unhappy and
+    nothing else. A connection error carries the whole DSN in its message."""
+    monkeypatch.setattr(storage, "STORAGE", Sulking())
+    body = client.get("/ready").text
+    assert "hunter2" not in body and "db:5432" not in body
+
+
+def test_readiness_does_not_hang_on_a_store_that_never_answers(client, monkeypatch):
+    """A dependency that has stopped answering does not answer in a moment
+    either, and a probe that hangs is a probe that never gets to say no."""
+
+    class Mute:
+        name = "mute"
+
+        async def ping(self) -> None:
+            await asyncio.sleep(30)
+
+    monkeypatch.setattr(main_mod, "STORE", Mute())
+    monkeypatch.setattr(main_mod, "READY_TIMEOUT", 0.05)
+
+    started = time.monotonic()
+    refused = client.get("/ready")
+    assert refused.status_code == 503
+    assert refused.json()["sessions"] == "TimeoutError"
+    assert time.monotonic() - started < 5, "readiness waited on it anyway"
+
+
 # ------------------------------------------------------------ provider failover
 
 
@@ -1184,6 +1242,164 @@ def test_erase_removes_one_caller_and_leaves_the_others(client, monkeypatch):
     leftover = json.loads((tools.DATA_DIR / "leads.json").read_text(encoding="utf-8"))
     assert all(row["email"] != "erase-me@acme.io" for row in leftover)
     assert any(row["email"] == "keep-me@acme.io" for row in leftover)
+
+def qualified(email: str) -> dict:
+    """A check_lead_qualification result, which is what puts an address into
+    a session's facts - the only place a live call is filed under a name."""
+    return tools.check_lead_qualification(email, "600")
+
+
+async def test_erasing_a_session_leaves_nothing_to_resume_it_from():
+    store = session_mod.SessionStore()
+    mine, theirs = await store.get(None), await store.get(None)
+    mine.add_tool_call("check_lead_qualification", {}, qualified("gone@acme-corp.io"))
+    theirs.add_tool_call("check_lead_qualification", {}, qualified("stays@acme-corp.io"))
+
+    assert await store.erase("gone@acme-corp.io") == 1
+    assert mine.ended, "a call in flight was left able to write its record"
+    assert (await store.get(mine.id)).id != mine.id, "the erased call was still resumable"
+    assert (await store.get(theirs.id)).id == theirs.id, "erased the wrong caller"
+
+
+async def test_a_call_is_erasable_by_the_address_it_booked_under():
+    """The agent books with whatever address the caller gave it for that, and
+    a caller can perfectly well give a different one from the one it scored."""
+    store = session_mod.SessionStore()
+    s = await store.get(None)
+    s.add_tool_call("check_lead_qualification", {}, qualified("scored@acme-corp.io"))
+    s.add_tool_call("book_calendar_slot", {}, {"ok": True, "email": "diary@acme-corp.io",
+                                               "start": next_weekday_slot()})
+
+    assert await store.erase("diary@acme-corp.io") == 1
+
+
+def test_erasure_reaches_a_session_still_in_redis(redis_store):
+    """The live transcript is the one thing here that is never sealed, and it
+    outlives the call by the session TTL. So erasure has to reach into it."""
+    store = redis_store()
+    ids = {}
+
+    async def drive():
+        for who, email in (("mine", "gone@acme-corp.io"), ("theirs", "stays@acme-corp.io")):
+            s = await store.get(None)
+            s.add_tool_call("check_lead_qualification", {}, qualified(email))
+            await store.put(s)
+            ids[who] = s.id
+        # One, not two: this session is in the local dict and in redis both.
+        assert await store.erase("gone@acme-corp.io") == 1
+
+    asyncio.run(drive())
+    assert redis_store.peek(ids["mine"]) is None, "the erased session is still in redis"
+    assert redis_store.peek(ids["theirs"]), "erased the wrong caller"
+
+
+def test_a_turn_after_the_erasure_does_not_put_the_call_back(redis_store):
+    """The call carries on - somebody is still on the line - but nothing said
+    after the request is written back where the erasure has already been."""
+    store = redis_store()
+    ids = {}
+
+    async def drive():
+        s = await store.get(None)
+        s.add_tool_call("check_lead_qualification", {}, qualified("gone@acme-corp.io"))
+        await store.put(s)
+        await store.erase("gone@acme-corp.io")
+        s.add_turn("user", "and one more thing before you go")
+        await store.put(s)  # the next turn of a call that is still happening
+        ids["s"] = s.id
+
+    asyncio.run(drive())
+    assert redis_store.peek(ids["s"]) is None, "the erased call wrote itself back"
+
+
+def test_a_call_that_ends_mid_erasure_is_still_erased(client, monkeypatch):
+    """The half-second the ordering in the handler is entirely about: the
+    request arrives, and the caller hangs up while it is being served.
+
+    Sweeping the files first leaves the record this call is about to write,
+    and nobody looks again. So the session goes first, and the call that ends
+    a moment later ends with nothing to write.
+    """
+    monkeypatch.setattr(main_mod, "AUTH_TOKEN", "s3cret")
+    live = asyncio.run(main_mod.STORE.get(None))  # a dict; it belongs to no loop
+    live.add_turn("user", "my email is hangs-up@acme-corp.io, we are 600 people")
+    live.add_tool_call("check_lead_qualification", {}, qualified("hangs-up@acme-corp.io"))
+    call = main_mod.Call(None, live, main_mod.app.state.llm)  # finalize never touches the socket
+
+    real = tools.erase_caller
+
+    def hangs_up_right_after_the_sweep(email):
+        removed = real(email)
+        asyncio.run(call.finalize())  # the real end of the call, a hair too late
+        return removed
+
+    monkeypatch.setattr(main_mod.tools, "erase_caller", hangs_up_right_after_the_sweep)
+    r = client.request("DELETE", "/data", params={"email": "hangs-up@acme-corp.io"},
+                       headers={"authorization": "Bearer s3cret"})
+
+    assert r.status_code == 200, r.text
+    assert not (session_mod.CALLS_DIR / f"{live.id}.json").exists(),         "the call wrote its record into the gap in the middle of the erasure"
+
+
+def test_a_call_erased_on_another_worker_writes_no_record(client, monkeypatch, redis_store):
+    """The request lands on whichever worker the balancer picked, and a call
+    lives on one worker only - so usually not the same one.
+
+    Nothing in the erasing worker can reach an object in another process, so
+    it leaves a note in Redis and the call reads it on its way out.
+    """
+    serving, erasing = redis_store(), redis_store()  # two workers, one redis
+    monkeypatch.setattr(main_mod, "STORE", serving)
+
+    async def drive():
+        live = await serving.get(None)
+        live.add_turn("user", "my email is other-worker@acme-corp.io, we are 600 people")
+        live.add_tool_call("check_lead_qualification", {}, qualified("other-worker@acme-corp.io"))
+        await serving.put(live)
+
+        assert await erasing.erase("other-worker@acme-corp.io") == 1
+        assert not live.ended, "the erasing worker cannot reach another process's object"
+
+        call = main_mod.Call(None, live, main_mod.app.state.llm)
+        assert await call.finalize() is None, "it wrote the record of an erased call"
+        return live.id
+
+    sid = asyncio.run(drive())
+    assert not (session_mod.CALLS_DIR / f"{sid}.json").exists()
+
+
+def test_erasure_reaches_a_call_that_is_still_happening(client, monkeypatch):
+    """The record of a call is written when it ends, so an erasure that swept
+    the files and rows first would be undone by the call a minute later.
+
+    The whole point of the ordering in the handler: the session goes first,
+    and a session that has been erased ends without writing anything.
+    """
+    monkeypatch.setattr(main_mod, "AUTH_TOKEN", "s3cret")
+    with client.websocket_connect("/ws?token=s3cret") as ws:  # erasure needs one set
+        ready, _ = collect(ws, "ready")
+        sid = ready["session_id"]
+        drain_greeting(ws)
+        ws.send_text(json.dumps(
+            {"type": "text", "text": "my email is live@acme-corp.io and we are 600 people"}
+        ))
+        # the tool is what puts the address into the session, so wait for that
+        # one rather than for the sentence it feeds
+        tool, _ = collect(ws, "tool")
+        assert tool["result"]["email"] == "live@acme-corp.io"
+
+        r = client.request("DELETE", "/data", params={"email": "live@acme-corp.io"},
+                           headers={"authorization": "Bearer s3cret"})
+        assert r.status_code == 200, r.text
+        removed = r.json()["removed"]
+        assert removed["sessions"] == 1, "the call in flight was left alone"
+        assert removed["leads"] >= 1 and removed["calls"] == 0  # it has not ended yet
+
+        ws.send_text(json.dumps({"type": "end"}))  # and now the caller hangs up
+
+    time.sleep(0.3)  # the record, if there were going to be one, is written here
+    assert not (session_mod.CALLS_DIR / f"{sid}.json").exists(),         "the erased call wrote its record on the way out"
+
 
 # --------------------------------------------------- encryption at rest
 
@@ -1818,6 +2034,15 @@ def booking(email: str, start: datetime) -> dict:
     }
 
 
+def test_a_postgres_ping_asks_the_database_and_not_its_own_flag(pg_store):
+    """ensure_schema remembers that it worked once. Readiness must not: a
+    database that has gone away since startup is the case /ready exists for."""
+    pg_store.ping()
+    pg_store.pool.close()
+    with pytest.raises(Exception):
+        pg_store.ping()
+
+
 def test_postgres_stores_a_lead_and_erases_it(pg_store):
     lead = {
         "email": "cto@acme.io", "domain": "acme.io", "company_size": 600,
@@ -1921,9 +2146,15 @@ def test_a_deadlocked_booking_asks_again(pg_store, monkeypatch):
             raise psycopg.errors.DeadlockDetected("deadlock detected")
         return real(*args, **kwargs)
 
+    waits = []
+    monkeypatch.setattr(storage.time, "sleep", waits.append)
     monkeypatch.setattr(pg_store.pool, "connection", deadlock_once)
     assert pg_store.book(booking("a@acme.io", slot(days_ahead=11)), 30, 3) is None
     assert len(attempts) == 2, "it gave up on a question it never got an answer to"
+    # Everyone postgres just shot is holding the same question. Asking it again
+    # in lockstep deadlocks the same way: six racers spent all three attempts
+    # colliding with each other before this wait existed.
+    assert waits and 0 < waits[0] < 1, f"it came straight back at the same instant: {waits}"
 
 
 def test_a_booking_that_only_ever_deadlocks_gives_up(pg_store, monkeypatch):

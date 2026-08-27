@@ -137,6 +137,19 @@ def blind(email: str) -> list[str]:
     ]
 
 
+def addresses(facts: Any) -> set[str]:
+    """Every address a call is filed under: the caller's, and the booking's.
+
+    The one place that decides what "this call is about that person" means,
+    because a call record on disk and a live session in Redis have to answer
+    it the same way or erasure clears one of them and leaves the other.
+    """
+    facts = facts or {}
+    booking = facts.get("booking") or {}
+    return {a for a in (str(facts.get("email", "")).lower(),
+                        str(booking.get("email", "")).lower()) if a}
+
+
 def read_record(path) -> dict:
     """A call record on its way back, sealed or not."""
     try:
@@ -309,6 +322,24 @@ class SessionStore:
     async def drop(self, session_id: str) -> None:
         self._items.pop(session_id, None)
 
+    async def erase(self, email: str) -> int:
+        """Forget every session held for this caller. See RedisSessionStore."""
+        gone = [s for s in list(self._items.values()) if email in addresses(s.facts)]
+        for s in gone:
+            s.ended = True
+            self._items.pop(s.id, None)
+        return len(gone)
+
+    async def erased(self, facts: Any) -> bool:
+        """Always no: with one process, erase already reached the call itself.
+
+        The cross-worker version of this question is RedisSessionStore's.
+        """
+        return False
+
+    async def ping(self) -> None:
+        """A dict is never unreachable, so readiness has nothing to ask it."""
+
     async def hold(self, session_id: str, token: str, ttl: float) -> None:
         self._holds[session_id] = token
 
@@ -353,6 +384,13 @@ class RedisSessionStore:
     def _hold_key(session_id: str) -> str:
         return f"drop:{session_id}"
 
+    @staticmethod
+    def _erased_key(email: str) -> str:
+        # Through blind(), so with a key set this note is an HMAC rather than
+        # a readable list of who asked to be forgotten - and without one it is
+        # the address, exactly as the rows it was erased from already were.
+        return f"erased:{blind(email)[0]}"
+
     async def get(self, session_id: str | None) -> Session:
         _evict(self._live, self.ttl)
         s = None
@@ -381,6 +419,10 @@ class RedisSessionStore:
             return None
 
     async def put(self, session: Session) -> None:
+        if session.ended:
+            # Saved, or erased. Either way this copy is finished, and writing
+            # it back is how an erased call in flight reappears a turn later.
+            return
         self._live[session.id] = session
         try:
             await self.redis.set(
@@ -414,6 +456,64 @@ class RedisSessionStore:
         except Exception as exc:  # noqa: BLE001
             log.warning("redis take failed; falling back to this worker: %s", exc)
             return local
+
+    async def erase(self, email: str) -> int:
+        """Forget every session held for this caller, live ones included.
+
+        A call in flight keeps its transcript here and nowhere else until it
+        ends, so an erasure that only swept the files and rows would come back
+        a minute later when the call wrote its record. Marking the session
+        ended is what stops that: finalize declines to write an ended call,
+        and put declines to store one.
+
+        Sessions are keyed by a random id rather than by the caller, so this
+        is a scan. There are as many keys as there are calls in the last half
+        hour, and this runs when a human asks it to, not on the call path.
+
+        Redis failures are not swallowed here the way they are everywhere else
+        in this class: a caller who is told their data is gone is owed that it
+        is gone, and a count arrived at by ignoring an error is a worse answer
+        than an error.
+        """
+        # ponytail: expires with the session TTL, which is longer than any
+        # call anyone has made here. A call still going after that writes its
+        # record; give the note its own longer TTL if that ever happens.
+        await self.redis.set(self._erased_key(email), "1", ex=self.ttl)
+        gone = set()
+        for s in list(self._live.values()):
+            if email in addresses(s.facts):
+                s.ended = True
+                self._live.pop(s.id, None)
+                gone.add(s.id)
+        async for key in self.redis.scan_iter(match=self._key("*"), count=100):
+            raw = await self.redis.get(key)
+            try:  # not _load: that one answers a dead redis with "no session",
+                # which is the right answer to a call and the wrong one to this
+                facts = json.loads(raw or "{}").get("facts")
+            except json.JSONDecodeError:
+                log.warning("unreadable session %s in redis; not erased", key)
+                continue
+            if email in addresses(facts):
+                await self.redis.delete(key)
+                gone.add(key.split(":", 1)[1])  # the id, so a live call counts once
+        return len(gone)
+
+    async def erased(self, facts: Any) -> bool:
+        """Was this call erased out from under the worker that is serving it.
+
+        A call lives on one worker and the erasure request lands on whichever
+        one the load balancer picked, so the two are usually not the same
+        worker. Deleting the shared copy does not reach the one in flight -
+        that object belongs to another process, which will happily write its
+        record when the caller hangs up, a minute after somebody was told
+        their data was gone. So the erasure leaves a note, and the call reads
+        it before it writes anything.
+        """
+        keys = [self._erased_key(a) for a in addresses(facts)]
+        return bool(keys) and bool(await self.redis.exists(*keys))
+
+    async def ping(self) -> None:
+        await self.redis.ping()
 
     def __len__(self) -> int:
         return len(self._live)

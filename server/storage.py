@@ -26,7 +26,9 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -174,6 +176,10 @@ class JsonStore:
                     self._save(name, kept)
         return removed
 
+    def ping(self) -> None:
+        """Nothing to reach: the files are on this disk or the write fails
+        loudly on its own. Readiness has no separate question to ask here."""
+
     def erase(self, email: str) -> dict:
         removed = {}
         with self._lock:
@@ -270,6 +276,12 @@ class PostgresStore:
                 log.warning("booking deadlocked; asking again (%s/3)", attempt + 1)
                 if attempt == 2:
                     raise  # three of these in a row is not contention any more
+                # Not immediately, and not all together: everyone who lost the
+                # last tie is holding the same question, and asking it again in
+                # lockstep deadlocks the same way it just did. The jitter is
+                # what breaks the herd up; without it six racers can spend all
+                # three attempts colliding with each other.
+                time.sleep(random.uniform(0.01, 0.05) * (attempt + 1))
 
     def purge(self, days: int) -> dict:
         if days <= 0:
@@ -286,6 +298,17 @@ class PostgresStore:
                 )
                 removed[table] = cur.rowcount
         return removed
+
+    def ping(self) -> None:
+        """Is the database actually there, asked now rather than at startup.
+
+        ensure_schema is a no-op once it has succeeded, so this costs one
+        round trip - and while it has not, this is also the retry: a server
+        that came up before its database becomes ready when the database does.
+        """
+        self.ensure_schema()
+        with self.pool.connection() as conn:
+            conn.execute("SELECT 1")
 
     def erase(self, email: str) -> dict:
         self.ensure_schema()
